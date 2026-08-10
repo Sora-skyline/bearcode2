@@ -1,0 +1,72 @@
+agents/subagent.py
+  s_80ac6017c61afd::t_d2bec2171debec 3-8
+agents/online_skill_evolution.py
+  s_80ac6017c61afd::t_d2bec2171debec 6-9,36,55,61,74
+agents/main.py
+  s_80ac6017c61afd::t_3157ac48b53dae 5-8,86,94,103,153,163,191,228,343
+agents/prompt.py
+  s_80ac6017c61afd::t_d2bec2171debec 5-8,132
+  s_80ac6017c61afd::t_c3f93c711e4722 226-231
+agents/frontmatter.py
+  s_80ac6017c61afd::t_d2bec2171debec 5-8
+agents/mcp_client.py
+  s_80ac6017c61afd::t_d2bec2171debec 27-30,53,223
+agents/online_skill_eval.py
+  s_80ac6017c61afd::t_2814a01812d3ae 6-9,49-51,53,58,68,85,91,110,115,148,169,187,348-350,352,385,398,562,623,625,688,793,801,817,822,1183,1212,1222,1242,1805,1811
+agents/skills.py
+  s_80ac6017c61afd::t_d2bec2171debec 6-9
+  s_80ac6017c61afd::t_c3f93c711e4722 10-13,92,238,254,271,455,468,473
+agents/memory.py
+  s_80ac6017c61afd::t_c3f93c711e4722 14-17,49,171,261,353
+  s_80ac6017c61afd::t_d2bec2171debec 10-13
+agents/session_memory.py
+  s_80ac6017c61afd::t_d2bec2171debec 6-9
+  s_80ac6017c61afd::t_c3f93c711e4722 10-13,173,178
+agents/agent.py
+  s_80ac6017c61afd::t_c3f93c711e4722 15-24,67,78,83,99,124,140,152,187-192,207,215,223,229,232,239,243,249,252,257,266,275,293,304,312,318,324,352-356,407,455,465-468,470,481,492-493,505,525-528,627,646,681,701,727,744,776,800,812,859,1197-1203,1212,1215,1400-1405,1421-1422,1479-1481,1502,1606-1607,1620-1624,1630-1631,1713-1718,1720,1723,1733,1735,1738,1742-1745,1755,1761,1770-1771,1787,1793,1814,1821,1842-1843
+  s_80ac6017c61afd::t_a9401a3649c902 1874,1900,1903,1907,1916,1933,1946,1960
+  s_80ac6017c61afd::t_6eeee65ec2fdcc 10-14
+agents/ui.py
+  s_80ac6017c61afd::t_d2bec2171debec 5-7,29,34,51,91,163,174,189,332,347
+agents/skill_evolution.py
+  s_80ac6017c61afd::t_d2bec2171debec 6-9,39,44,49,56,66,72,92,226,569
+agents/session.py
+  s_80ac6017c61afd::t_d2bec2171debec 7-10
+agents/tools.py
+  s_80ac6017c61afd::t_3157ac48b53dae 7-10
+  s_80ac6017c61afd::t_c3f93c711e4722 11-15,49,59-60,270,281,325,332,344,359,385,411,441,488,509,528,572,577,584,624,645,667-669,745-747,847
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "3.2.115",
+  "base_commit_sha": "c6f77771cbc141871282fd3fe4ceaddd960e7688",
+  "prompts": {
+    "s_80ac6017c61afd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fea5d-9389-7ff3-b064-3c268462680b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "sora_skyline <zhouyuan90@huawei.com>",
+      "total_additions": 324,
+      "total_deletions": 26,
+      "accepted_lines": 324,
+      "overriden_lines": 0
+    }
+  },
+  "humans": {
+    "h_980cd48a740375": {
+      "author": "sora_skyline <zhouyuan90@huawei.com>"
+    }
+  },
+  "sessions": {
+    "s_80ac6017c61afd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fea5d-9389-7ff3-b064-3c268462680b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "sora_skyline <zhouyuan90@huawei.com>"
+    }
+  }
+}
