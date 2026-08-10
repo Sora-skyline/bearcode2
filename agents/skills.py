@@ -3,6 +3,14 @@
 Skill 是可复用的方法/流程，而不是事实记忆。用户级与项目级 ``SKILL.md`` 被解析为
 ``SkillDefinition``；检索只负责提示“可能相关”，显式调用才会返回完整 prompt 或 fork
 配置。创建、演化和使用统计的实际落盘由 ``skill_evolution`` 完成。
+
+需要区分三种动作：``retrieve_relevant_skills`` 只给模型相关摘要；``execute_skill`` 才
+展开完整方法并记录显式调用；``create/evolve_skill`` 才修改磁盘。相关性命中不等于
+模型实际采用，因此在线统计会另外记录 relevant 与 used。
+
+从 Harness 视角看，Skill 不是一个新的基础模型，也不一定执行代码；它主要是一段经过
+沉淀的操作说明。inline Skill 把说明加入主 Agent 上下文，fork Skill 则用独立子 Agent
+执行说明，二者最终仍复用同一套“模型 -> 工具 -> 结果”循环。
 """
 
 from __future__ import annotations
@@ -81,6 +89,7 @@ def resolve_skill_prompt(skill: SkillDefinition, args: object) -> str:
     return prompt
 
 def get_skill_by_name(skill_name:str)->SkillDefinition | None:
+    """按 frontmatter name 精确查找已发现的 Skill。"""
     # 通过 name 查找 skill；name 来自 frontmatter，没有写时使用目录名。
     for s in discover_skills():
         if s.name == skill_name:
@@ -226,6 +235,7 @@ _STOP_TOKENS = {
 
 
 def _tokens(text: str) -> set[str]:
+    """生成去重词元，适合计算 query 与 Skill 的覆盖关系。"""
     raw = str(text or "").lower().replace("_", " ").replace("-", " ")
     found = {m.group(0) for m in _TOKEN_RE.finditer(raw)}
     expanded = set(found)
@@ -241,6 +251,7 @@ def _tokens(text: str) -> set[str]:
 
 
 def _token_list(text: str) -> list[str]:
+    """保留重复词元，供 BM25 风格的词频与文档长度计算。"""
     raw = str(text or "").lower().replace("_", " ").replace("-", " ")
     tokens = [m.group(0) for m in _TOKEN_RE.finditer(raw)]
     for chunk in re.findall(r"[\u4e00-\u9fff]+", raw):
@@ -257,6 +268,7 @@ def _token_list(text: str) -> list[str]:
 
 
 def _skill_search_text(skill: SkillDefinition) -> str:
+    """拼接名称、描述、触发条件和 prompt，形成统一检索语料。"""
     return "\n".join(
         [
             skill.name,
@@ -440,6 +452,7 @@ def record_online_provenance(
     decision: dict[str, Any] | None = None,
     error: str = "",
 ) -> None:
+    """把在线 Extractor/Maintainer 的决定转发给持久化审计层。"""
     record_online_skill_provenance(
         action=action,
         skill_name=skill_name,
@@ -452,10 +465,12 @@ def record_online_provenance(
 
 
 def record_feedback(skill_name: str, rating: str, note: str = "") -> None:
+    """记录用户对已存在 Skill 的显式评分与说明。"""
     record_skill_feedback(skill_name=skill_name, rating=rating, note=note)
 
 
 def skill_stats() -> str:
+    """返回适合 REPL 展示的 Skill 生命周期统计摘要。"""
     return format_skill_stats()
 
 

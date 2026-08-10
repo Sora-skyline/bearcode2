@@ -3,6 +3,10 @@
 本模块是“决策层”：Extractor 判断是否存在稳定可复用经验，Maintainer 决定 add、merge
 或 discard，``online_ingest`` 编排权限与 provenance。文件写入、历史快照和统计由
 ``skill_evolution`` 负责。
+
+完整链路分两次对话完成：本轮回答先进入 pending window，下一轮用户反馈补齐结果证据；
+随后 Extractor 产出候选，Maintainer 与现有 Skill 比较，最后才可能写入。这个延迟窗口
+避免仅凭模型自己的回答就把未经用户验证的做法沉淀成长期 Skill。
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ class OnlineSkillCandidate:
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
+    """从 side query 的纯 JSON 或夹带说明文本中容错提取对象。"""
     raw = str(text or "").strip()
     if not raw:
         return {}
@@ -47,11 +52,13 @@ def _parse_json_object(text: str) -> dict[str, Any]:
 
 
 def _normalize_identity(text: str) -> str:
+    """规范化中英文名称文本，供候选与现有 Skill 做稳定身份比较。"""
     raw = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", " ", str(text or "").lower())
     return re.sub(r"\s+", " ", raw).strip()
 
 
 def _candidate_search_text(candidate: OnlineSkillCandidate) -> str:
+    """拼接候选的可检索字段，用于相似 Skill 召回。"""
     return "\n".join(
         [
             candidate.name,
@@ -64,6 +71,7 @@ def _candidate_search_text(candidate: OnlineSkillCandidate) -> str:
 
 
 def _coerce_candidate(obj: dict[str, Any]) -> OnlineSkillCandidate | None:
+    """校验 Extractor 输出的最低字段，并转换为内部候选对象。"""
     name = str(obj.get("name") or "").strip()
     description = str(obj.get("description") or "").strip()
     instructions = str(obj.get("instructions") or obj.get("prompt") or "").strip()

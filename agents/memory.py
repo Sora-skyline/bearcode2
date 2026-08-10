@@ -7,6 +7,14 @@
 3. MEMORY.md 是自动生成的索引，给 system prompt 快速展示已有记忆。
 4. 对话时先轻量扫描记忆文件头，再用 side query 让模型挑出相关记忆。
 5. 召回到的记忆会以 <system-reminder> 形式注入当前对话。
+
+``MEMORY.md`` 只是一份低成本目录，会进入 system prompt；真正正文由
+``select_relevant_memories`` 按需读取。这样长期记忆数量增长时，不会把所有历史事实都
+塞进每次模型请求。这里保存的是跨会话事实/偏好，不是当前任务的 Session Memory。
+
+与另外两种“让 Agent 记住东西”的机制要区分：消息历史保存当前对话原文；
+``session_memory.py`` 把过长的当前对话折叠成任务状态；Skill 保存可复用的做事流程。
+本模块的 Memory 更像项目事实和用户偏好的长期知识库。
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ class MemoryEntry:
     __slots__ = ("name", "description", "type", "filename", "content")
 
     def __init__(self, name: str, description: str, type: str, filename: str, content: str):
+        """保存一条完整记忆的展示字段与 Markdown 正文。"""
         self.name = name
         self.description = description
         self.type = type
@@ -159,6 +168,7 @@ class MemoryHeader:
 
     def __init__(self, filename: str, file_path: str, mtime_ms: float,
                  description: str | None, type: str | None):
+        """保存召回第一阶段所需的轻量字段，不携带正文。"""
         self.filename = filename
         self.file_path = file_path
         self.mtime_ms = mtime_ms
@@ -248,6 +258,7 @@ class RelevantMemory:
     __slots__ = ("path", "content", "mtime_ms", "header")
 
     def __init__(self, path: str, content: str, mtime_ms: float, header: str):
+        """保存已经通过相关性筛选、等待注入当前会话的记忆。"""
         self.path = path
         self.content = content
         self.mtime_ms = mtime_ms
@@ -339,6 +350,7 @@ class MemoryPrefetch:
     """封装 memory 召回异步任务，供 Agent 主循环轮询。"""
 
     def __init__(self, task: asyncio.Task):
+        """包装后台召回任务，并记录其结果是否已被主循环消费。"""
         self.task = task
         # consumed 表示结果是否已经注入过，避免同一个任务结果重复使用。
         self.consumed = False

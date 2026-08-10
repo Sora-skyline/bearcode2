@@ -2,6 +2,10 @@
 
 基础行为模板之外，还会拼接当前目录、日期/平台、Git、Memory 索引、Skills、子 Agent、
 deferred tools 和项目规则，因此 prompt 是 Runtime 能力快照，不是固定字符串。
+
+``SYSTEM_PROMPT_TEMPLATE`` 定义稳定行为，``build_system_prompt`` 负责注入运行期快照；
+Agent 在 Skill/MCP/Plan 状态变化后会重新构建它。新增动态能力时应增加独立 section，
+不要在模板中硬编码一次启动后可能过期的内容。
 """
 
 from __future__ import annotations
@@ -125,6 +129,7 @@ def _resolve_includes(
         visited = set()
 
     def _replace(m: _re.Match) -> str:
+        """把单条 include 替换为文件内容，错误时留下可诊断的 HTML 注释。"""
         # include 相对路径以当前规则文件所在目录为基准，而不是固定以 cwd 为基准。
         raw = m.group(1)
         if raw.startswith("~/"):
@@ -218,7 +223,12 @@ def get_git_context() -> str:
 
 
 def build_system_prompt() -> str:
-    """组装当前运行环境的完整 system prompt。"""
+    """组装当前运行环境的完整 system prompt。
+
+    system prompt 是 Harness 每次请求携带的运行时说明书：除了行为规则，还包含工作目录、
+    Git 状态、长期 Memory 索引、Skill 和子 Agent 摘要。它与用户消息分开，前者定义能力
+    和约束，后者描述本轮具体任务。
+    """
     from datetime import date
     today = date.today().isoformat()
     plat = f"{platform.system()} {platform.machine()}"

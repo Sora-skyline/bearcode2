@@ -4,6 +4,10 @@
 完整协议消息按 session id 保存到用户级目录，供 --resume 恢复；每次上下文折叠的
 结构化记忆则以 JSONL 和 latest 快照写入项目 .bear/sessions，便于逐次审计。
 Agent Runtime 负责决定保存时机，本模块只处理文件布局。
+
+两类文件用途不同：``~/.bear-code/sessions`` 的完整协议消息用于 ``--resume``；项目内
+``.bear/sessions`` 的 folding 记录用于观察压缩过程。后者不能单独还原完整对话，前者
+也不适合作为精简后的模型上下文。
 """
 
 from __future__ import annotations

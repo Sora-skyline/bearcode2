@@ -3,6 +3,10 @@
 评测以真实 provenance 构造 replay，从当前 active Skill 编译程序规则和可选 LLM judge
 规则，再结合 retrieved/relevant/used 信号判定 lineage 状态。失败规则可以产生候选变体，
 但 champion 仅是本地最佳记录，不会覆盖 active SKILL.md。
+
+评测流水线可按五段阅读：加载在线证据 -> 冻结 replay 并稳定划分 dev/test -> 从 Skill
+文本编译规则 -> 在相同任务上比较当前版本与候选变体 -> 保存 run/champion 审计产物。
+``champion`` 与 active Skill 刻意分离，意味着一次离线评测不会悄悄改变 Agent 行为。
 """
 
 from __future__ import annotations
@@ -42,11 +46,16 @@ _RE_CONCLUSION = re.compile(r"(?i)\b(tl;dr|answer|conclusion|bottom line)\b|结�
 _RE_PARAGRAPH_LIMIT = re.compile(r"(不超过|少于|最多|within|less than|at most)\s*(\d+)\s*(段|paragraph)")
 
 
+# ─── 基础存储与稳定标识：所有评测产物都按 Skill lineage 隔离 ───
+
+
 def _utc_now() -> str:
+    """返回 run/report 使用的 UTC 时间戳。"""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _read_json(path: Path, default: Any) -> Any:
+    """容错读取聚合 JSON；评测不因单个缺失产物整体失败。"""
     if not path.is_file():
         return default
     try:
@@ -56,6 +65,7 @@ def _read_json(path: Path, default: Any) -> Any:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """逐行读取事件/数据集，并跳过无法解析的坏行。"""
     if not path.is_file():
         return []
     rows: list[dict[str, Any]] = []
@@ -72,11 +82,13 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _write_json(path: Path, value: Any) -> None:
+    """写入格式化 JSON 审计快照。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    """重写一份稳定排序后的 replay 或 judgment 数据集。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
@@ -95,10 +107,12 @@ def _pct(value: float) -> str:
 
 
 def _stable_hash(value: Any) -> str:
+    """对规范 JSON 取稳定哈希，作为跨运行可复现的样本/变体标识。"""
     return hashlib.sha1(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _lineage_id_for_skill(skill_name: str) -> str:
+    """把 Skill 名称映射为短 lineage 目录 id。"""
     return "skill-" + _stable_hash({"name": str(skill_name or "").strip()})[:16]
 
 
@@ -131,6 +145,7 @@ def _normalize_text(text: str) -> str:
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
+    """从 LLM 的纯 JSON 或带解释输出中提取首尾对象。"""
     raw = str(text or "").strip()
     if not raw:
         return {}
@@ -151,6 +166,7 @@ def _parse_json_object(text: str) -> dict[str, Any]:
 
 
 def _action_bucket(action: str) -> str:
+    """把细分维护动作归并为报告中的固定统计桶。"""
     raw = str(action or "none").strip().lower() or "none"
     if raw.endswith("_denied"):
         return "denied"
@@ -168,6 +184,7 @@ def _latest_message(messages: list[dict[str, Any]], role: str) -> str:
 
 
 def _normalized_messages(value: Any) -> list[dict[str, str]]:
+    """只保留 replay 需要的 user/assistant 纯文本消息。"""
     out: list[dict[str, str]] = []
     if not isinstance(value, list):
         return out
@@ -328,7 +345,11 @@ def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = Fals
     return rules[:8]
 
 
+# ─── 规则执行：程序规则保持确定性，语义规则才调用 LLM judge ───
+
+
 def _skill_alignment_requirement(skill: dict[str, Any], *, max_chars: int = 3200) -> str:
+    """把 Skill 可观察要求压缩成 LLM judge 的二元判定标准。"""
     parts: list[str] = []
     name = str(skill.get("name") or "").strip()
     description = str(skill.get("description") or "").strip()
@@ -361,6 +382,7 @@ def _skill_alignment_requirement(skill: dict[str, Any], *, max_chars: int = 3200
 
 
 def _paragraph_limit(text: str) -> int:
+    """从中英文 Skill 文本中提取明确的段落上限。"""
     for match in _RE_PARAGRAPH_LIMIT.finditer(str(text or "")):
         try:
             return max(1, int(match.group(2)))
@@ -373,6 +395,7 @@ def _paragraph_limit(text: str) -> int:
 
 
 def _evaluate_rule(rule: dict[str, Any], response_text: str) -> dict[str, Any]:
+    """对一条历史回答执行确定性规则，并返回可审计细节。"""
     params = rule.get("params") if isinstance(rule.get("params"), dict) else {}
     mode = str(params.get("mode") or "").strip()
     text = str(response_text or "")
@@ -536,6 +559,7 @@ def _active_skill_snapshots() -> dict[str, dict[str, Any]]:
 
 
 def _rows_by_skill(provenance_rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """把扁平在线事件按最终 Skill 名称归并为 lineage 输入。"""
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in provenance_rows:
         skill = str(row.get("skill") or "").strip()
@@ -596,7 +620,9 @@ def _build_replay_pool(
     return _freeze_replay_pool(skill_name=skill_name, samples=ordered)
 
 
+# dev 用于生成/挑选候选，promotion_test 只用于最终晋级，避免同一证据既改又验。
 def _split_score(sample_id: str) -> float:
+    """把稳定样本 id 映射到 0..1，用于跨运行不漂移的数据划分。"""
     raw = str(sample_id or "")
     seed = raw[:8] if len(raw) >= 8 else _stable_hash(raw)[:8]
     try:
@@ -659,6 +685,7 @@ def _freeze_replay_pool(*, skill_name: str, samples: list[dict[str, Any]]) -> li
 
 
 def _summarize_rule_outcomes(rules: list[dict[str, Any]], samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """在历史真实回复上执行全部程序规则并汇总通过率。"""
     outcomes: list[dict[str, Any]] = []
     for sample in samples:
         # 基线评估直接使用历史 latest_assistant，不重新调用回答模型。
@@ -763,6 +790,7 @@ def _summarize_outcomes_from_rows(
 
 
 def _snapshot_with_instructions(snapshot: dict[str, Any], *, instructions: str, label: str) -> dict[str, Any]:
+    """复制 Skill 快照并替换 instructions，构造不落盘的候选版本。"""
     out = dict(snapshot or {})
     out["instructions"] = str(instructions or "")
     out["mutation_label"] = str(label or "")
@@ -770,6 +798,7 @@ def _snapshot_with_instructions(snapshot: dict[str, Any], *, instructions: str, 
 
 
 def _append_eval_guards(instructions: str, additions: list[str]) -> str:
+    """把针对失败规则的最小 guard 追加到候选指令末尾。"""
     body = str(instructions or "").rstrip()
     clean = [str(item or "").strip() for item in additions if str(item or "").strip()]
     if not clean:
@@ -785,10 +814,12 @@ def _append_eval_guards(instructions: str, additions: list[str]) -> str:
 
 
 def _candidate_variant_id(*, lineage_id: str, label: str, snapshot: dict[str, Any]) -> str:
+    """根据 lineage、标签和内容生成可复现候选 id。"""
     return f"candidate-{_stable_hash({'lineage_id': lineage_id, 'label': label, 'snapshot': snapshot})[:12]}"
 
 
 def _rule_by_id(rules: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """建立规则索引，供候选生成阶段按失败 id 查约束。"""
     return {str(rule.get("rule_id") or ""): rule for rule in rules if str(rule.get("rule_id") or "")}
 
 
@@ -1149,6 +1180,7 @@ def _skill_status(
 
 
 def _run_id(lineage_id: str) -> str:
+    """生成带时间和 lineage 前缀的单次评测目录名。"""
     return f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{str(lineage_id or '')[-6:]}"
 
 
@@ -1177,6 +1209,7 @@ def _variant_summary(
 
 
 def _load_champion(lineage_id: str) -> dict[str, Any]:
+    """读取该 lineage 当前本地 champion；不存在时返回空对象。"""
     registry = _read_json(_champions_registry_path(), {"champions": {}})
     if not isinstance(registry, dict):
         return {}
@@ -1186,6 +1219,7 @@ def _load_champion(lineage_id: str) -> dict[str, Any]:
 
 
 def _set_champion(lineage_id: str, payload: dict[str, Any]) -> None:
+    """更新 champion 注册表与 lineage 快照，但不覆盖 active SKILL.md。"""
     # champions.json 提供全局索引；lineage 目录保留独立记录和可阅读的 SKILL.md 快照。
     path = _champions_registry_path()
     registry = _read_json(path, {"version": 1, "champions": {}})
@@ -1205,6 +1239,7 @@ def _set_champion(lineage_id: str, payload: dict[str, Any]) -> None:
 
 
 def _write_champion_skill_file(path: Path, snapshot: dict[str, Any]) -> None:
+    """将 champion 内容写成独立可审阅 SKILL.md 副本。"""
     name = str(snapshot.get("name") or "unnamed-skill").strip()
     description = str(snapshot.get("description") or "").strip()
     when_to_use = str(snapshot.get("when_to_use") or "").strip()
@@ -1767,11 +1802,13 @@ async def evaluate_online_skill_evolution_async(
 
 
 def _status_rank(status: str) -> int:
+    """定义 REPL 报告的风险优先排序，较需关注的状态排在前面。"""
     order = {"watch": 0, "incubating": 1, "unobserved": 2, "pruned": 3, "healthy": 4}
     return order.get(str(status or ""), 9)
 
 
 def _format_eval_failure_summary(eval_data: dict[str, Any], *, limit: int = 2) -> str:
+    """提取少量失败原因供终端摘要，完整 judgment 仍保留在 artifact。"""
     failures = eval_data.get("failures") if isinstance(eval_data.get("failures"), list) else []
     parts: list[str] = []
     for failure in failures[: max(1, int(limit))]:

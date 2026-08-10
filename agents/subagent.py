@@ -1,6 +1,11 @@
 """子代理系统 —— 内置代理类型 + 自定义代理类型的 fork-return 模式。
 镜像了 Claude Code 的 AgentTool：explore（只读）、plan（结构化）、general（全量工具），
-另外支持通过 .bear/agents/*.md 定义用户自定义代理。"""
+另外支持通过 .bear/agents/*.md 定义用户自定义代理。
+
+这里仅做“配置发现与能力裁剪”，真正的子 Agent 实例由 ``Agent._execute_agent_tool``
+创建。父子之间只传 prompt 和最终文本/token 统计，不共享消息历史；因此 fork 能隔离
+探索噪声，但不是独立进程或安全沙箱。
+"""
 
 from __future__ import annotations
 

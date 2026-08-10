@@ -3,6 +3,14 @@
 本模块只负责协议消息转录、折叠结果校验和上下文注入格式，不直接调用模型或写文件。
 OpenAI 与 Anthropic 历史先转成统一的可读 transcript，再由 Agent 的 side query 生成
 episode、working、tool 三类记忆；模型输出异常时回退为截断后的原始转录。
+
+阅读顺序：``build_*_transcript`` 消除协议差异，``parse_folded_memory`` 收窄模型输出，
+``format_folded_memory`` 再把结构化状态放回消息历史。本模块不做长期学习，折叠内容只
+用于压缩后继续当前任务。
+
+可以把它理解成一次“任务交接”：原始对话太长时，把已经完成什么、目前卡在哪里、工具
+有哪些经验整理成结构化摘要，再用这份摘要替换较旧历史。它解决的是上下文窗口容量问题，
+不会像长期 Memory 那样自动成为以后每个新会话都可召回的知识。
 """
 
 from __future__ import annotations
@@ -162,10 +170,12 @@ def _extract_json_text(text: str) -> str:
 
 
 def _as_list(value: Any) -> list:
+    """把模型返回的非列表字段安全降级为空列表。"""
     return value if isinstance(value, list) else []
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
+    """把模型返回的非对象字段安全降级为空对象。"""
     return value if isinstance(value, dict) else {}
 
 

@@ -2,6 +2,10 @@
 
 本模块只负责把命令行、环境变量和用户输入转换成 ``Agent`` 的运行配置；模型循环、
 工具执行和持久化能力由其他模块实现。入口同时支持一次性 prompt 与持续 REPL。
+
+阅读时可把它看成三层：``main`` 负责启动配置，``run_repl`` 负责本地命令分流，只有
+普通用户输入最终进入 ``Agent.chat``。因此新增 REPL 命令通常改这里，新增模型工具则
+应该改 ``tools.py`` 及 Runtime 路由，而不是塞进 CLI。
 """
 
 from __future__ import annotations
@@ -79,6 +83,7 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
 
 
 def _clean_env(value: str | None) -> str | None:
+    """把空白环境变量视为未配置，避免空字符串覆盖后续回退项。"""
     if value is None:
         return None
     value = value.strip()
@@ -86,6 +91,7 @@ def _clean_env(value: str | None) -> str | None:
 
 
 def _load_env_file() -> None:
+    """从当前项目向上寻找 .env，且不覆盖调用进程已经设置的变量。"""
     env_path = find_dotenv(usecwd=True)
     if env_path:
         load_dotenv(env_path, override=False)
@@ -94,6 +100,7 @@ def _load_env_file() -> None:
 
 
 def _is_anthropic_compatible_base_url(base_url: str | None) -> bool:
+    """通过 URL 路径识别项目约定的 Anthropic-compatible 网关。"""
     if not base_url:
         return False
     parsed = urlparse(base_url)
@@ -143,6 +150,7 @@ async def run_repl(agent: Agent) -> None:
     """运行交互循环，并在入口层处理不需要模型参与的斜杠命令。"""
 
     async def confirm_fn(message: str) -> bool:
+        """把 Runtime 的抽象确认回调接到终端 y/n 输入。"""
         try:
             answer = input("  Allow? (y/n): ")
             return answer.lower().startswith("y")
@@ -152,6 +160,7 @@ async def run_repl(agent: Agent) -> None:
     agent.set_confirm_fn(confirm_fn)
 
     async def plan_approval_fn(plan_content: str) -> dict:
+        """把计划审批选项转换为 Agent 能识别的结构化 choice。"""
         print_plan_for_approval(plan_content)
         print_plan_approval_options()
         while True:
@@ -179,6 +188,7 @@ async def run_repl(agent: Agent) -> None:
     sigint_count = 0
 
     def handle_sigint(sig, frame):
+        """任务运行中首次 Ctrl+C 只中止任务；空闲时连续两次才退出 REPL。"""
         nonlocal sigint_count
         if agent._aborted is False and agent._output_buffer is not None:
             # Agent is processing
@@ -215,6 +225,7 @@ async def run_repl(agent: Agent) -> None:
             print_goodbye()
             break
 
+        # 分流优先级：内置控制命令 -> 显式 Skill 命令 -> 普通自然语言对话。
         # 这些 REPL 命令直接操作 Runtime 状态或本地数据，不需要额外消耗一次主模型调用。
         if inp == "/clear":
             agent.clear_history()
@@ -329,7 +340,7 @@ async def run_repl(agent: Agent) -> None:
                         print_error(str(e))
                 continue
 
-        # Normal chat
+        # 普通输入到这里才真正进入 main.py -> Agent.chat() -> 协议 Agent Loop。
         try:
             await agent.chat(inp)
         except Exception as e:

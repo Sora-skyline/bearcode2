@@ -2,6 +2,9 @@
 
 本模块不参与 Agent 决策；Runtime 只传入结构化或文本结果，UI 再负责安全编码、颜色、
 摘要和 spinner 生命周期。
+
+UI 函数应保持“只展示、不改变 Runtime 状态”。尤其是工具结果只在终端截断显示，传回
+模型的完整/持久化结果由 Agent 决定；不要把展示层的省略误认为上下文也被省略。
 """
 
 from __future__ import annotations
@@ -23,10 +26,12 @@ console = Console(highlight=False)
 
 
 def _safe_text(value: object) -> str:
+    """替换无法编码的字符，保证 Rich 或重定向终端不会因脏文本崩溃。"""
     return str(value).encode("utf-8", errors="replace").decode("utf-8")
 
 
 def _safe_stdout_write(text: object) -> None:
+    """直接输出模型流式文本并立即 flush，避免被 Rich 二次解释。"""
     sys.stdout.write(_safe_text(text))
     sys.stdout.flush()
 
@@ -43,6 +48,7 @@ COOKIE_BEAR = r"""
 
 
 def print_welcome() -> None:
+    """渲染启动横幅和最常用 REPL 命令。"""
     title = Text("Bear Code", style="bold #f6c177")
     subtitle = Text("Evolvable Coding Agent CLI", style="bold cyan")
     cookie = Text(COOKIE_BEAR, style="bold #d19a66")
@@ -82,6 +88,7 @@ def print_user_prompt() -> None:
 
 
 def print_assistant_text(text: str) -> None:
+    """输出一段流式模型正文，不自动添加换行。"""
     _safe_stdout_write(text)
 
 
@@ -153,6 +160,7 @@ def _print_file_change_result(_name: str, result: str) -> None:
 
 
 def print_error(msg: str) -> None:
+    """以统一错误面板展示可恢复的 CLI/Runtime 错误。"""
     console.print(Panel(
         _safe_text(msg),
         title="[bold red]Error[/bold red]",
@@ -163,6 +171,7 @@ def print_error(msg: str) -> None:
 
 
 def print_confirmation(command: str) -> None:
+    """展示待确认动作；实际读取 y/n 的职责仍在 CLI 回调。"""
     console.print(Panel(
         _safe_text(command),
         title="[bold yellow]Dangerous command[/bold yellow]",
@@ -177,6 +186,7 @@ def print_divider() -> None:
 
 
 def print_cost(input_tokens: int, output_tokens: int) -> None:
+    """展示累计 token 与基于固定单价的粗略费用估算。"""
     cost_in = (input_tokens / 1_000_000) * 3
     cost_out = (output_tokens / 1_000_000) * 15
     total = cost_in + cost_out
@@ -319,6 +329,7 @@ def print_sub_agent_end(agent_type: str, _description: str) -> None:
 
 
 def print_memory_entries(memories: list[object]) -> None:
+    """把 MemoryEntry 列表渲染为紧凑表格，不读取记忆正文。"""
     table = Table(box=box.ROUNDED, header_style="bold cyan", border_style="cyan")
     table.add_column("Type", style="bold #f6c177", no_wrap=True)
     table.add_column("Name", style="white")
@@ -333,6 +344,7 @@ def print_memory_entries(memories: list[object]) -> None:
 
 
 def print_skill_entries(skills: list[object]) -> None:
+    """展示可发现 Skill 的名称、来源、上下文方式和触发说明。"""
     table = Table(box=box.ROUNDED, header_style="bold cyan", border_style="cyan")
     table.add_column("Skill", style="bold #f6c177", no_wrap=True)
     table.add_column("Source", style="cyan", no_wrap=True)

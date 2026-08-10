@@ -4,6 +4,15 @@
 模型看到的 schema 定义在 ``tool_definitions``；``check_permission`` 只做授权决策，
 ``execute_tool`` 才执行动作。子 Agent、Skill、MCP 和 Plan Mode 的特殊路由留在
 ``agents.agent``，以避免工具模块反向依赖整个 Runtime。
+
+扩展一个内置工具时通常需要三步：在 ``tool_definitions`` 声明 schema，实现返回文本的
+handler，再在 ``execute_tool`` 注册；若工具有副作用，还要把它纳入权限分类。这里刻意
+把“模型能看见什么”“是否授权”“实际执行”拆开，便于分别审计。
+
+初学者容易误以为 tool schema 就是函数调用。实际上 schema 只是发给模型的一份“能力
+菜单”：模型只能据此生成工具名和 JSON 参数；Python Runtime 收到这些数据后，仍要经过
+权限判断和路由，才会调用本文件中的真实 handler。所有 handler 最终返回字符串，是因为
+工具结果还要作为消息交给模型阅读，而不是直接成为最终答复。
 """
 
 from __future__ import annotations
@@ -37,7 +46,7 @@ CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search"}
 
 
 def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
-    """过滤并返回当前可用的工具定义列表，主要用于 API 调用前剔除尚未激活的“延迟工具”（deferred tools），并删除无关的元数据字段。"""
+    """生成本次模型请求真正可见的工具菜单，并去掉 Runtime 私有元数据。"""
     tools = all_tools if all_tools is not None else tool_definitions
     return [
         {k: v for k, v in t.items() if k != "deferred"}
@@ -47,7 +56,8 @@ def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[
 
 
 
-#工具定义
+# 工具定义只描述名字、用途和 JSON 入参，供模型选择；这里没有执行逻辑。
+# 真实实现位于下方 _read_file 等 handler，并由 execute_tool 按 name 分发。
 tool_definitions: list[ToolDef] = [
     {
         "name": "read_file",
@@ -257,6 +267,7 @@ def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
 
 #读取文件并且在读取文件的基础上添加行号
 def _read_file(inp:dict) -> str:
+    """读取文本并添加行号，让模型后续能精确引用和编辑位置。"""
     try:
         path = _resolve_tool_path(inp["file_path"])
         content = path.read_text(errors="replace")
@@ -267,6 +278,7 @@ def _read_file(inp:dict) -> str:
         return f"Error reading file: {e}"
 
 def _write_file(inp:dict) -> str:
+    """覆盖写入目标文件，并返回限制长度的内容预览。"""
     try:
         path = _resolve_tool_path(inp["file_path"], must_exist=False)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -310,12 +322,14 @@ def _auto_update_memory_index(file_path:str) -> None:
 
 #将各种Unicode引号字符统一转换为标准的ASCII直引号。
 def _normalize_quotes(s: str) -> str:
+    """统一弯引号与直引号，提高模型复制片段后的精确匹配成功率。"""
     s = re.sub("[\u2018\u2019\u2032]", "'", s)
     s = re.sub('[\u201c\u201d\u2033]', '"', s)
     return s
 
 #查询匹配到的字符串
 def _find_actual_string(file_content: str, search_string: str) -> str | None:
+    """优先精确匹配，失败后仅放宽 Unicode 引号差异。"""
     if search_string in file_content:
         return search_string
     norm_search = _normalize_quotes(search_string)
@@ -327,6 +341,7 @@ def _find_actual_string(file_content: str, search_string: str) -> str | None:
 
 #生成一个简单的文本差异格式
 def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
+    """为终端展示生成最小 unified-diff 风格片段，不承担补丁应用。"""
     before_change = old_content.split(old_string)[0]
     line_num = before_change.count("\n") + 1
     old_lines = old_string.split("\n")
@@ -341,6 +356,7 @@ def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
 
 #编辑文件
 def _edit_file(inp: dict) -> str:
+    """只替换唯一命中的 old_string，避免模糊编辑误伤其他代码。"""
     try:
         path = _resolve_tool_path(inp["file_path"])
         content = path.read_text(errors="replace")
@@ -366,6 +382,7 @@ def _edit_file(inp: dict) -> str:
 
 
 def _list_files(inp: dict) -> str:
+    """按 glob 列出文件，并跳过依赖目录与 Git 内部数据。"""
     try:
         base = _resolve_tool_path(inp.get("path") or ".")
         pattern = inp["pattern"]
@@ -391,6 +408,7 @@ def _list_files(inp: dict) -> str:
 
 
 def _grep_search(inp: dict) -> str:
+    """优先使用系统 grep；不可用或执行失败时回退到纯 Python 搜索。"""
     pattern = inp["pattern"]
     path = str(_resolve_tool_path(inp.get("path") or "."))
     include = inp.get("include")
@@ -420,6 +438,7 @@ def _grep_search(inp: dict) -> str:
 
 
 def _grep_python(pattern: str, directory: str, include: str | None) -> str:
+    """提供跨平台递归正则搜索，并对返回条数设置上限。"""
     regex = re.compile(pattern)
     include_pattern = include
     matches: list[str] = []
@@ -466,6 +485,7 @@ MAX_RESULT_CHARS = 50000
 
 
 def _truncate_result(result:str) -> str:
+    """保留超长结果首尾，控制单个工具结果对上下文窗口的占用。"""
     if len(result) <= MAX_RESULT_CHARS:
         return result
     keep_each = (MAX_RESULT_CHARS - 60) // 2
@@ -486,6 +506,7 @@ _activated_tools: set[str] = set()
 
 
 def reset_activated_tools() -> None:
+    """清除进程内 deferred tool 激活状态，主要供测试或能力刷新使用。"""
     _activated_tools.clear()
 
 def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
@@ -504,6 +525,7 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
 
 #执行shell命令
 def _run_shell(inp: dict) -> str:
+    """执行已通过权限层的 Shell 命令，并统一超时与错误文本。"""
     try:
         timeout_ms = inp.get("timeout", 30000)
         timeout_s = timeout_ms / 1000
@@ -547,16 +569,19 @@ DANGEROUS_PATTERNS = [
     re.compile(r"\bStop-Process\s", re.IGNORECASE),
 ]
 def is_dangerous(command: str) -> bool:
+    """用保守模式识别需要二次确认的高风险 Shell 命令。"""
     return any(p.search(command) for p in DANGEROUS_PATTERNS)
 
 #权限规则
 def _parse_rule(rule: str) -> dict:
+    """把 ``tool(pattern)`` 设置语法拆成工具名和可选匹配模式。"""
     m = re.match(r"^([a-z_]+)\((.+)\)$", rule)
     if m:
         return {"tool": m.group(1), "pattern": m.group(2)}
     return {"tool": rule, "pattern": None}
 
 def _load_settings(file_path: Path) -> dict | None:
+    """容错读取单个 settings.json；坏配置不阻断 Agent 启动。"""
     if not file_path.exists():
         return None
     try:
@@ -596,6 +621,7 @@ def load_permission_rules() -> dict:
 
 
 def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
+    """匹配工具名及命令/文件路径，尾部星号表示前缀规则。"""
     if rule["tool"] != tool_name:
         return False
     if rule["pattern"] is None:
@@ -616,6 +642,7 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
 
 
 def _check_permission_rules(tool_name: str, inp: dict) -> str | None:
+    """应用用户级与项目级规则，并确保 deny 的优先级高于 allow。"""
     rules = load_permission_rules()
     # deny 必须先检查，避免同一调用同时命中 allow 时被意外放行。
     for rule in rules["deny"]:
@@ -637,6 +664,9 @@ def check_permission(
 
     本函数不执行确认交互；它只返回决策，主 Agent 再通过 ``confirm_fn`` 向用户询问。
     Plan Mode 仅允许只读工具及指定 plan 文件，``bypassPermissions`` 则最先放行。
+
+    权限判断和工具执行分成两个函数，是 Harness 的安全边界：即使模型被错误提示诱导去
+    写文件或执行危险命令，它也不能绕过这段本地代码直接操作系统。
     """
     if mode == "bypassPermissions":
         # yolo 模式最高优先级：跳过配置规则和内置风险判断。
@@ -712,6 +742,9 @@ async def execute_tool(
 
     ``read_file_state`` 记录模型最近读取的文件版本：写已有文件前必须先读，且外部修改
     后必须重新读取。``tool_search`` 在这里激活 deferred schema，而不执行目标工具。
+
+    调用方已经做过权限检查；本函数关注执行和一致性保护。返回值统一为文本，之后由
+    Agent 包装成对应模型协议的工具结果消息。
     """
     if name == "read_file":
         result = _read_file(inp)
@@ -811,5 +844,6 @@ async def execute_tool(
 
 
 def reset_permission_cache() -> None:
+    """使下一次权限检查重新读取磁盘 settings.json。"""
     global _cached_rules
     _cached_rules = None

@@ -3,6 +3,10 @@
 这里不判断“应该学什么”，只负责安全地创建/演化 SKILL.md，并维护 usage、provenance、
 history 与 stale pruning 数据。决策层在 ``online_skill_evolution``，质量评测层在
 ``online_skill_eval``。
+
+可审计性是本模块的主线：任何 create/merge 都先解析现有 frontmatter，写入前保留历史
+快照，写入后追加 provenance/usage 记录。不要在这里调用模型做“是否值得学习”的判断，
+否则持久化层会同时承担决策职责而难以测试。
 """
 
 from __future__ import annotations
@@ -32,20 +36,24 @@ def get_evolution_dir() -> Path:
 
 
 def _utc_now() -> str:
+    """返回审计日志统一使用的 UTC ISO 时间。"""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _today() -> str:
+    """返回按天聚合统计使用的 UTC 日期。"""
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    """以单行 JSON 追加不可变事件，保留完整演化时间线。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _read_json(path: Path, default: Any) -> Any:
+    """容错读取派生索引；缺失或损坏时返回调用方提供的初始值。"""
     if not path.is_file():
         return default
     try:
@@ -55,11 +63,13 @@ def _read_json(path: Path, default: Any) -> Any:
 
 
 def _write_json(path: Path, value: Any) -> None:
+    """写入便于人工审阅的 UTF-8 格式化 JSON 快照。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _safe_skill_slug(name: str) -> str:
+    """生成可作为目录名的稳定 slug，并限制路径字符范围。"""
     raw = str(name or "").strip()
     slug = re.sub(r"[^A-Za-z0-9_.\-\u4e00-\u9fff]+", "-", raw)
     slug = re.sub(r"-{2,}", "-", slug).strip("-.")
@@ -79,6 +89,7 @@ def _preview(value: object, limit: int = 500) -> str:
 
 
 def _compact_messages(messages: list[dict[str, Any]], *, max_messages: int = 12, max_chars: int = 4000) -> list[dict[str, str]]:
+    """压缩 provenance 中的对话证据，防止审计日志无限膨胀。"""
     out: list[dict[str, str]] = []
     for item in list(messages or [])[-max_messages:]:
         if not isinstance(item, dict):
@@ -212,6 +223,7 @@ def _parse_int(value: str | None, default: int = 0) -> int:
 
 
 def _bump_patch(version: str | None) -> str:
+    """把 Skill 版本提升一个 patch；异常版本从 0.1.0 起步。"""
     raw = str(version or "0.1.0").strip()
     parts = raw.split(".")
     if len(parts) < 3 or not all(p.isdigit() for p in parts[:3]):
@@ -554,6 +566,7 @@ def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
 
 
 def _sync_usage_into_provenance(stats: dict[str, Any]) -> None:
+    """把最新使用统计回填聚合 provenance 索引，便于单文件审阅 lineage。"""
     path = get_evolution_dir() / ONLINE_PROVENANCE_INDEX
     index = _read_json(path, {})
     if not isinstance(index, dict):

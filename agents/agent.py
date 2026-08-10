@@ -7,6 +7,21 @@ Skills、MCP 和子 Agent 串成持续循环。Agent.chat 是单轮总入口，�
 
 BearCode2 在基础压缩流水线之外增加了结构化 Session Memory folding：既可在上下文
 达到阈值时自动触发，也允许模型通过 compact_context 工具主动触发。
+
+推荐阅读顺序：先看 ``Agent.chat`` 理解单轮入口，再看 ``_chat_anthropic`` 或
+``_chat_openai`` 理解“模型 -> tool call -> tool result”的循环，最后看
+``_execute_tool_call``、压缩流水线和在线 Skill 演化。构造函数中的大量字段只是这些
+子系统的会话级状态，不必在第一次阅读时逐个记忆。
+
+没有 Harness 基础时，可以先记住下面这个最小心智模型：
+
+1. 大模型本身不会直接读文件或执行命令，只会返回文本，或生成“想调用哪个工具及参数”。
+2. Harness 保存消息历史、把工具 schema 发给模型，并决定模型提出的工具调用是否获准。
+3. 获准后由本地 Python 代码真正执行工具，再把结果作为新消息交还模型。
+4. 模型根据工具结果继续推理；只要它仍返回工具调用，Harness 就重复这个循环。
+5. 当模型只返回正文、不再调用工具时，当前用户请求才算完成。
+
+因此 ``Agent`` 不是另一个模型，而是包在模型 API 外面的编排层（orchestrator）。
 """
 
 from __future__ import annotations
@@ -49,6 +64,7 @@ from agents.ui import print_info, print_divider, print_assistant_text, print_sub
 
 
 def _is_retryable(error: Exception) -> bool:
+    """只把限流、服务过载和短暂网络错误交给指数退避重试。"""
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
     if status in (429, 503, 529):
         return True
@@ -59,10 +75,12 @@ def _is_retryable(error: Exception) -> bool:
 
 
 def _safe_utf8_text(value: object) -> str:
+    """替换非法 Unicode 字节，避免终端输出或 SDK 序列化中断整个会话。"""
     return str(value).encode("utf-8", errors="replace").decode("utf-8")
 
 
 def _sanitize_for_utf8(value: Any) -> Any:
+    """递归清洗即将写入协议消息或发送给模型的容器。"""
     if isinstance(value, str):
         return _safe_utf8_text(value)
     if isinstance(value, list):
@@ -78,6 +96,7 @@ def _sanitize_for_utf8(value: Any) -> Any:
 
 
 async def _with_retry(fn, max_retries: int = 3):
+    """执行异步模型请求；仅对可恢复错误做带抖动的指数退避。"""
     for attempt in range(max_retries + 1):
         try:
             return await fn()
@@ -102,6 +121,7 @@ MODEL_CONTEXT = {
 }
 
 def _get_context_windows(model:str)->int:
+    """返回模型标称上下文；未知兼容模型采用项目的保守默认值。"""
     return MODEL_CONTEXT.get(model, 200000)
 
 
@@ -117,6 +137,7 @@ KEEP_RECENT_RESULTS = 3
 
 
 def _get_max_output_tokens(model: str) -> int:
+    """按模型族选择单次最大输出，为 thinking 与正文共同预留空间。"""
     m = model.lower()
     if "opus-4-6" in m:
         return 64000
@@ -128,6 +149,7 @@ def _get_max_output_tokens(model: str) -> int:
 
 #转换tool的形式到openai
 def _to_openai_tools(tools: list[ToolDef]) -> list[dict]:
+    """把内部 Anthropic 风格 schema 适配成 OpenAI function tools。"""
     return [
         {
             "type": "function",
@@ -162,6 +184,12 @@ class Agent:
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
                  is_sub_agent: bool=False,):
+        """创建一份会话级 Runtime 状态，并按 API 协议初始化对应客户端。
+
+        ``custom_system_prompt`` 和 ``custom_tools`` 主要供子 Agent/Skill fork 使用；
+        主 Agent 默认从磁盘动态构建 prompt，并拥有完整内置工具集合。
+        """
+        # ── 运行策略：决定模型、权限、工具边界以及何时停止 ──
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
@@ -176,6 +204,7 @@ class Agent:
         self.session_id = uuid.uuid4().hex[:8]
         self.session_start_time= time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
 
+        # ── 计量状态：每次模型响应后累计，用于 /cost 和预算熔断 ──
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.last_input_token_count = 0
@@ -183,6 +212,7 @@ class Agent:
         self.last_api_call_time = 0
 
 
+        # ── 控制状态：中止、交互确认和“编辑前必须读取”都只在当前会话生效 ──
         self._aborted = False
         #存储异步任务
         self._current_task:asyncio.Task | None = None
@@ -190,39 +220,41 @@ class Agent:
         self._confirmed_paths: set[str] = set()
 
 
-        # 计划模式”（Plan Mode）状态的变量
+        # ── Plan Mode：保存进入前模式，并只允许计划文件成为写入例外 ──
         self._pre_plan_mode: str | None=None
         self._plan_file_path: str | None=None
         self._plan_approval_fn : Callable[[str], Awaitable[bool]] | None=None
         self._context_cleared : bool=False
 
-        #思考模式
+        # thinking 模式由“用户开关 + 模型能力”共同决定，不能只看 CLI 参数。
         self._thinking_mode = self._resolve_thinking_mode()
 
-        #子agent的输出缓存
+        # ── 输出缓冲：子 Agent/run_once 收集文本，主 REPL 则直接流式打印 ──
         self._output_buffer: list[str] | None=None
         self._turn_output_buffer: list[str] | None = None
 
         # 编辑前读取
         self._read_file_state: dict[str, float] ={}
 
-        #MCP集成
+        # ── 外部能力：MCP 在第一次 chat 时懒连接，避免启动 CLI 就拉起子进程 ──
         self._mcp_manager = McpManager()
         self._mcp_initialized = False
 
-        #记忆回溯
+        # ── 长期 Memory：去重集合与字节预算防止同一事实反复注入 ──
         #记忆agent已经回答过的信息
         self._already_surfaced_memories: set[str] = set()
         #当前会话占用的字节数
         self._session_memory_bytes = 0
 
-        #区分message的历史消息
+        # ── 对话历史：两种 API 协议格式不同，因此分别保存，运行时只使用其中一套 ──
         self._anthropic_messages: list[str] = []
         self._openai_messages: list[str] = []
+        # ── 在线 Skill：保留本轮检索证据，并等待下一轮用户反馈补全抽取窗口 ──
         self._last_retrieved_skill_reference: dict[str, Any] | None = None
         self._last_retrieved_skill_hits: list[dict[str, Any]] = []
         self._pending_skill_extraction_window: dict[str, Any] | None = None
         self._background_skill_tasks: set[asyncio.Task] = set()
+        # ── Session Memory：它服务于当前任务续跑，不等同于跨会话长期 Memory ──
         # 每次上下文折叠都保留结构化记录，并维护用于提示模型的运行期触发信号。
         self._folded_session_memories: list[dict[str, Any]] = []
         self._fold_last_time: float = 0.0
@@ -231,7 +263,7 @@ class Agent:
         self._same_tool_repeat_count: int = 0
         self._last_tool_name: str = ""
 
-        #构建系统提示词
+        # system prompt 是当前能力快照；Plan/Fold 提示在基础 prompt 之上动态拼接。
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
 
         if self.permission_mode == "plan":
@@ -240,7 +272,7 @@ class Agent:
         else:
             self._system_prompt = self._base_system_prompt
 
-        #初始化大模型客户端
+        # 只初始化一种协议客户端；use_openai 同时决定消息格式和后续 Agent Loop。
         if self.use_openai:
             self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
             self._anthropic_client = None
@@ -258,6 +290,7 @@ class Agent:
 
     #判断返回模型的思考模式
     def _resolve_thinking_mode(self) -> str:
+        """把 thinking 请求降级为模型实际支持的 disabled/enabled/adaptive。"""
         if not self.thinking:
             return "disabled"
         if not self._model_supports_thinking():
@@ -268,6 +301,7 @@ class Agent:
         return "enabled"
 
     def _model_supports_thinking(self) -> bool:
+        """按模型名做兼容性判断，避免向旧模型发送不支持的参数。"""
         m = self.model.lower()
         if "claude-3-" in m or "3-5-" in m or "3-7-" in m:
             return False
@@ -275,16 +309,19 @@ class Agent:
             return True
         return False
     def _model_supports_adaptive_thinking(self) -> bool:
+        """判断是否可由模型自行调节 thinking 预算。"""
         m = self.model.lower()
         return "opus-4-6" in m or "sonnet-4-6" in m
 
     #生成一个用于保存 AI 计划（Plan）的 Markdown 文件的绝对路径。
     def _generate_plan_file_path(self) -> str:
+        """为本会话生成唯一计划文件，作为 Plan Mode 唯一可写例外。"""
         d = Path.home() / ".bear" / "plans"
         d.mkdir(parents=True, exist_ok=True)
         return str(d / f"plan-{self.session_id}.md")
 
     def _build_plan_mode_prompt(self) -> str:
+        """生成只读规划约束，并把本会话计划文件路径明确告知模型。"""
         return f"""
 
     # Plan Mode Active
@@ -312,6 +349,11 @@ class Agent:
 
     #大模型调用的工厂方法,构建一个用于记忆召回（memory recall）的 sideQuery 可调用对象，兼容anthropic, openai。
     def _build_side_query(self, *, max_tokens: int = 256):
+        """构造不污染主历史的轻量模型调用，供 Memory/Skill 判定复用。
+
+        side query 使用相同客户端和模型，但只携带专用 system/user prompt；因此召回、
+        折叠和评审结果不会把辅助对话写进主 Agent Loop。
+        """
         if self._anthropic_client:
             client = self._anthropic_client
             model = self.model
@@ -362,6 +404,7 @@ class Agent:
         return None
     #异步任务取消（Abort）
     def abort(self) -> None:
+        """标记当前循环中止，并取消正在等待的模型任务。"""
         self._aborted = True
         if self._current_task and not self._current_task.done():
             self._current_task.cancel()
@@ -409,6 +452,7 @@ class Agent:
             return "plan"
 
     def get_token_usage(self) -> dict:
+        """返回包含子 Agent 消耗在内的会话累计 token。"""
         return {"input":self.total_input_tokens, "output":self.total_output_tokens}
 
     #主入口
@@ -418,8 +462,12 @@ class Agent:
 
         original_user_message 始终保留纯用户输入；实际发给模型的 user_message 可能
         追加检索到的 Skill 上下文。MCP 在主 Agent 的第一次对话中懒加载。
+
+        从调用关系看，CLI/REPL 只负责把输入交给这里；这里准备运行时能力后，再把控制权
+        交给某个协议循环。协议循环可能请求模型多次，所以“一次 chat”不等于“一次 API
+        请求”，而是直到模型给出最终文本为止的一整轮 Agent 任务。
         """
-        #懒加载MCP服务在第一次chat的时候
+        # 阶段 1：首次对话发现 MCP 工具；子 Agent 不再重复创建 MCP 子进程。
         if not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
             try:
@@ -430,6 +478,7 @@ class Agent:
             except Exception as e:
                 print_error(f"MCP init failed: {e}")
 
+        # 阶段 2：保留纯用户输入用于审计，同时给实际模型输入追加相关 Skill 摘要。
         original_user_message = _safe_utf8_text(user_message)
         ready_skill_extraction_window: dict[str, Any] | None = None
         self._last_retrieved_skill_reference = None
@@ -440,6 +489,8 @@ class Agent:
                 original_user_message
             )
 
+        # 阶段 3：选择协议循环。两条循环语义相同，但消息/tool result 格式不同。
+        # create_task 让 abort() 可以持有并取消整条 Agent 执行链，而不只是停止终端输出。
         self._aborted = False
         self._turn_output_buffer = []
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
@@ -451,6 +502,7 @@ class Agent:
 
         finally:
             self._current_task = None
+        # 阶段 4：主回复完成后再做统计与在线演化，避免辅助模型请求增加响应延迟。
         assistant_text = "".join(self._turn_output_buffer or []).strip()
         self._turn_output_buffer = None
         if not self.is_sub_agent and not self._aborted:
@@ -470,6 +522,10 @@ class Agent:
 
    #执行一次对话，收集本轮模型输出文本，并返回本轮消耗的 token 数
     async def run_once(self, prompt:str)->None:
+        """以非交互方式执行一轮，并返回文本和本轮 token 增量。
+
+        子 Agent 和 fork Skill 依赖这个接口把结果交还父 Agent，而不是直接写终端。
+        """
         self._output_buffer = []
         prev_in = self.total_input_tokens
         prev_out = self.total_output_tokens
@@ -568,6 +624,7 @@ class Agent:
         return f"{user_message}\n\n{context}", top_ref
 
     def _strip_runtime_injections(self, text: str) -> str:
+        """移除 Runtime 添加的 Skill 上下文，避免其被误当作用户反馈学习。"""
         return re.sub(r"\n*<retrieved_skills>.*?</retrieved_skills>\s*", "", str(text or ""), flags=re.DOTALL).strip()
 
     def _message_text(self, msg: dict[str, Any]) -> str:
@@ -586,6 +643,7 @@ class Agent:
         return ""
 
     def _recent_dialog_messages(self, *, max_messages: int = 8) -> list[dict[str, str]]:
+        """抽取不含工具块的近期对话，作为在线 Skill 抽取的最小证据窗口。"""
         raw_messages = self._openai_messages if self.use_openai else self._anthropic_messages
         out: list[dict[str, str]] = []
         for msg in raw_messages:
@@ -620,6 +678,7 @@ class Agent:
         return raw not in {"0", "false", "no", "off"}
 
     def _schedule_background_skill_task(self, coro) -> None:
+        """托管在线 Skill 后台任务；Plan Mode 中直接关闭协程以保持只读。"""
         if self.permission_mode == "plan":
             try:
                 coro.close()
@@ -639,6 +698,7 @@ class Agent:
         task.add_done_callback(_done)
 
     async def drain_background_skill_tasks(self) -> None:
+        """等待尚未结束的 Skill 统计/演化任务，供 CLI 退出前安全收尾。"""
         tasks = [task for task in self._background_skill_tasks if not task.done()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -664,6 +724,7 @@ class Agent:
         assistant_text: str,
         retrieved_reference: dict[str, Any] | None,
     ) -> None:
+        """暂存本轮问答，下一轮用户消息将作为结果反馈补入该窗口。"""
         if not original_user_message.strip() or not assistant_text.strip():
             return
         self._pending_skill_extraction_window = {
@@ -680,6 +741,7 @@ class Agent:
         return {k: v for k, v in ref.items() if k != "all_hits"}
 
     async def _run_online_skill_evolution(self, window: dict[str, Any], *, interactive_confirm: bool = False) -> None:
+        """把完整反馈窗口交给 Extractor/Maintainer，并在写入后刷新能力快照。"""
         if not self._online_evolution_enabled() or self.permission_mode == "plan":
             return
         messages = list(window.get("messages") or [])
@@ -711,6 +773,7 @@ class Agent:
             print_error(f"Online skill evolution failed: {result.get('error') or result}")
 
     async def _run_skill_usage_tracking(self, original_user_message: str, assistant_text: str) -> None:
+        """判断检索命中的 Skill 是否真正相关/被使用，更新可审计统计。"""
         if not self._online_evolution_enabled() or self.permission_mode == "plan":
             return
         hits = list(self._last_retrieved_skill_hits or [])
@@ -734,6 +797,7 @@ class Agent:
             return
 
     async def extract_now(self, hint: str = "") -> dict[str, Any]:
+        """手动消费 pending window；用于 REPL 的 /extract_now 命令。"""
         pending = self._pending_skill_extraction_window
         if not pending:
             return {"ok": False, "error": "no pending online skill extraction window"}
@@ -745,6 +809,7 @@ class Agent:
 
 
     def clear_history(self)->None:
+        """清空协议历史和会话统计，但保留客户端、工具与当前权限配置。"""
         self._anthropic_messages = []
         self._openai_messages = []
         self._pending_skill_extraction_window = None
@@ -791,6 +856,7 @@ class Agent:
 
     #恢复会话信息
     def restore_session(self, data:dict)->None:
+        """恢复持久化消息与 folding 记录；协议消息会在使用前再次规范化。"""
         if data.get("anthropicMessages"):
             self._anthropic_messages = self._normalize_anthropic_messages(_sanitize_for_utf8(data["anthropicMessages"]))
         if data.get("openaiMessages"):
@@ -1125,10 +1191,16 @@ class Agent:
             f"Preview (first 200 lines):\n{preview}"
         )
 
-    #执行工具入口
+    #执行工具入口(cy)
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
-        """统一分发折叠、Plan、子 Agent、Skill、MCP 与普通内置工具。"""
+        """统一分发折叠、Plan、子 Agent、Skill、MCP 与普通内置工具。
+
+        这层是工具路由器，不负责理解模型意图。外层协议循环已经解析参数并完成权限检查；
+        这里根据工具名选择真正的 Python 实现，最后统一返回字符串。该字符串随后会被包装成
+        ``tool_result`` 或 ``role=tool`` 消息，成为模型下一次 API 请求的新观察结果。
+        """
+        # 这些工具要读写 Agent 自身状态，因此留在 Runtime 内处理，不能当成普通文件工具。
         if name == "compact_context":
             return await self._execute_compact_context_tool(inp)
         if name in ("enter_plan_mode", "exit_plan_mode"):
@@ -1137,9 +1209,10 @@ class Agent:
             return await self._execute_agent_tool(inp)
         if name == "skill":
             return await self._execute_skill_tool(inp)
-            # Route MCP tool calls to the MCP manager
+        # MCP 工具由外部 Server 实现；本进程只通过 McpManager 转发名称和参数。
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
+        # 其余名称落到 tools.py：这里包含读写文件、搜索、Shell 等内置能力。
         result = await execute_tool(name, inp, self._read_file_state)
         if name in {"skill_create", "skill_evolve"}:
             try:
@@ -1324,7 +1397,12 @@ class Agent:
 
 #--------------Anthropic 后端---------------
     async def  _chat_anthropic(self, user_message: str) -> None:
-        """运行 Anthropic tool_use/tool_result 协议循环，并提前执行并发安全工具。"""
+        """运行 Anthropic tool_use/tool_result 协议循环，并提前执行并发安全工具。
+
+        Anthropic 把一次回复表示成多个 content block：普通正文是 ``text``，工具意图是
+        ``tool_use``。Harness 执行后要用相同 id 返回 ``tool_result``，模型才能知道每个
+        结果对应哪个调用。
+        """
         self._anthropic_messages = self._normalize_anthropic_messages(_sanitize_for_utf8(self._anthropic_messages))
         user_message = _safe_utf8_text(user_message)
         # 先把本轮用户输入放入 Anthropic 消息历史，后续每轮模型调用都会带上这段上下文。
@@ -1340,6 +1418,8 @@ class Agent:
                     user_message, sq,
                     self._already_surfaced_memories, self._session_memory_bytes,
                 )
+        # while 的一次迭代就是一次内部 Agent turn：调模型一次，必要时再执行一批工具。
+        # 它不同于用户看到的一轮 chat；一个 chat 往往会包含多个这样的内部 turn。
         while True:
             # 外部请求中止时，结束整个 agent loop。
             if self._aborted:
@@ -1396,7 +1476,9 @@ class Agent:
                         early_executions[block["id"]] = task
 
 
-            # 调用 Anthropic 流式接口；流式过程中完成 tool block 时会触发 _on_tool_block。
+            # 调用 Anthropic 流式接口。system、tools 和完整消息历史都会随本次请求发出；
+            # 模型没有隐藏的本地状态，只能看到 Harness 明确放进请求的内容。
+            # 流式过程中完成 tool block 时会触发 _on_tool_block。
             response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
             if not self.is_sub_agent:
                 stop_spinner()
@@ -1417,6 +1499,7 @@ class Agent:
             })
 
             # 没有工具调用，说明模型已经给出最终回复，本轮对话结束。
+            # 若存在 tool_use，即使同时输出了文字，也还不是完整结束：工具结果需再喂回模型。
             if not tool_uses:
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens)
@@ -1520,6 +1603,8 @@ class Agent:
             # 工具结果可能很长，每轮工具执行后检查是否需要压缩上下文。
             self._refresh_runtime_system_prompt()
             await self._check_and_compact()
+            # 不 break 就回到 while 顶部。下一次模型请求会带上刚追加的 tool_result，
+            # 模型据此决定继续调用工具，还是生成最终回答。
 
     @staticmethod
     def _block_to_dict(block) -> dict:
@@ -1532,11 +1617,18 @@ class Agent:
         return {"type": _safe_utf8_text(block.type)}
 
     async def _call_anthropic_stream(self, on_tool_block_complete=None):
+        """消费 Anthropic 流事件，并还原一条完整 assistant 消息。
+
+        流式传输只是降低首字延迟，并没有改变 Agent 语义。正文分片可以立即展示；工具参数
+        必须先把 partial JSON 拼完整，之后才能安全地交给工具执行层。
+        """
 
         async def _do():
             max_output =  _get_max_output_tokens(self.model)
 
             create_params: dict[str, Any] = {
+                # system 告诉模型角色/环境，tools 声明可请求的动作，messages 保存任务状态。
+                # tools 只是 JSON schema，并不会因为放进请求就自动执行任何本地代码。
                 "model": self.model,
                 "max_tokens": max_output if self._thinking_mode != "disabled" else 16384,
                 "system": _safe_utf8_text(self._system_prompt),
@@ -1618,11 +1710,17 @@ class Agent:
     #openAI后端
 
     async def _chat_openai(self, user_message:str) -> None:
-        """运行 OpenAI tool_calls/role=tool 协议循环，并批量执行只读工具。"""
+        """运行 OpenAI tool_calls/role=tool 协议循环，并批量执行只读工具。
+
+        OpenAI 协议中，模型先返回带 ``tool_calls`` 的 assistant 消息；Harness 再为每个
+        ``tool_call_id`` 追加一条 ``role=tool`` 消息。两者必须同时保留在历史里，下一次
+        请求才能形成完整的“提出调用 -> 得到结果”因果链。
+        """
         user_message = _safe_utf8_text(user_message)
+        # _openai_messages 是当前会话的真实状态；API 本身不会替 Harness 保存这段历史。
         self._openai_messages.append({"role": "user", "content": user_message})
 
-        #预取句柄 MemoryPrefetch
+        # 主 Agent 异步预取 Memory；子 Agent 依靠自己的隔离 prompt，不读取长期记忆。
         memory_prefetch: MemoryPrefetch | None = None
         if not self.is_sub_agent:
             sq = self._build_side_query()
@@ -1632,13 +1730,19 @@ class Agent:
                     self._already_surfaced_memories, self._session_memory_bytes,
                 )
 
+        # 一次 while 迭代对应一次模型 API 请求，以及该回复要求的一批本地工具执行。
         while True:
+            # abort() 会取消当前 Task；循环边界也检查标记，避免继续发起下一次模型请求。
             if self._aborted:
                 break
-
+            # 每次模型调用前先缩减旧工具结果，尽量把 token 留给有效对话。
             self._run_compression_pipeline()
 
             if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
+                # settled 只表示异步召回完成；consumed 保证同一批 Memory 只注入一次。
+                # 当前这一轮已经发出去的 LLM 请求，没有记忆，继续输出，输出不中断
+                # 预取记忆 settled 之后，把记忆写入本地 state.messages（内存里的对话历史）
+                # 下一次工具调用 / 下一次 agent 内部 turn 迭代的时候，新的 LLM 请求带上这份 memory
                 memory_prefetch.consumed = True
                 try:
                     memories = memory_prefetch.task.result()
@@ -1648,11 +1752,13 @@ class Agent:
                         last = self._openai_messages[-1] if self._openai_messages else None
 
                         if last and last.get("role") == "user":
+                            # 优先附加到最后一条 user 消息，保持当前请求与召回内容相邻。
                             last["content"] = (last.get("content") or "") + "\n\n" + injection_text
                         else:
                             self._openai_messages.append({"role": "user", "content": injection_text})
 
                         for m in memories:
+                            # 记录去重集合和会话字节预算，控制后续轮次的重复/过量召回。
                             self._already_surfaced_memories.add(m.path)
                             self._session_memory_bytes += len(m.content.encode())
                 except Exception:
@@ -1661,6 +1767,8 @@ class Agent:
             if not self.is_sub_agent:
                 start_spinner()
 
+            # 请求中携带 system/user/assistant/tool 历史和当前可见工具 schema。
+            # 这里返回的是已由 _call_openai_stream 从分片重新组装好的完整响应。
             response = await self._call_openai_stream()
 
             if not self.is_sub_agent:
@@ -1676,11 +1784,13 @@ class Agent:
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
             message = choice.get("message", {})
 
+            # assistant 消息必须先入历史。后面追加的 role=tool 要用 tool_call_id 指向它。
             self._openai_messages.append(message)
 
             tool_calls = message.get("tool_calls")
 
             if not tool_calls:
+                # 没有 tool_calls 表示模型只给出了最终正文，Agent loop 可以结束。
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens)
                 break
@@ -1701,12 +1811,14 @@ class Agent:
 
                 fn_name = tc["function"]["name"]
                 try:
+                    # function.arguments 在协议中是 JSON 字符串，不是已经可调用的 Python 参数。
                     inp = json.loads(tc["function"]["arguments"])
                 except Exception:
                     inp = {}
 
                 print_tool_call(fn_name, inp)
 
+                # 模型能提出工具调用不代表一定能执行；本地权限层拥有最终决定权。
                 perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
 
                 if perm["action"] == "deny":
@@ -1716,17 +1828,22 @@ class Agent:
                                         "result": f"Action denied: {perm.get('message', '')}"})
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
+                    # 弹出终端对话框，让用户确认危险操作
                     confirmed = await self._confirm_dangerous(perm["message"])
+                    # 用户点击拒绝的情况
                     if not confirmed:
                         self._record_tool_outcome(fn_name, False)
                         oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
                                             "result": "User denied this action."})
                         continue
+                    # 用户点击同意：加入已确认集合，下次不再弹窗
                     self._confirmed_paths.add(perm["message"])
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
                 oai_batches: list[dict] = []
                 for ct in oai_checked:
+                    # 只读、无副作用的工具可放入并发批次；写文件和 Shell 等保持串行，(cy)
+                    # 避免执行顺序变化导致后一个调用看不到前一个调用产生的状态。
                     safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
                     if safe and oai_batches and oai_batches[-1]["concurrent"]:
                         oai_batches[-1]["items"].append(ct)
@@ -1737,30 +1854,31 @@ class Agent:
                 for batch in oai_batches:
                     if oai_context_break or self._aborted:
                         break
-
+                    #并发批次执行
                     if batch["concurrent"]:
                         async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
                             raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
                             raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct_item["fn"], raw)
+                            res = self._persist_large_result(ct_item["fn"], raw)# 关联你最开始看的三层上下文压缩
                             print_tool_result(ct_item["fn"], res)
                             return ct_item, res
 
                         results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                        for ct_item, res in results:
+                        for ct_item, res in results:# 循环写入 OpenAI 标准消息
                             self._record_tool_outcome(
                                 ct_item["fn"],
                                 not self._looks_like_tool_failure(ct_item["fn"], "", res),
                             )
                             self._openai_messages.append(
                                 {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
-                    else:
+                    else: # 串行批次执行
                         for ct in batch["items"]:
-                            if not ct["allowed"]:
+                            if not ct["allowed"]:# 先处理权限被拒绝的工具
+                                # 即使权限拒绝，也必须返回 role=tool，让模型看到失败原因并改道。
                                 self._openai_messages.append(
                                     {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
                                 continue
-
+                            # 正常放行工具串行执行
                             raw = await self._execute_tool_call(ct["fn"], ct["inp"])
                             raw = _safe_utf8_text(raw)
                             res = self._persist_large_result(ct["fn"], raw)
@@ -1769,24 +1887,37 @@ class Agent:
                                 ct["fn"],
                                 not self._looks_like_tool_failure(ct["fn"], raw, res),
                             )
-
+                            # 核心特殊逻辑：self._context_cleared 上下文清空熔断
+                            # 当本轮工具执行后，上下文 token 超限，触发了全局上下文清理机制（/compact 压缩或内存溢出裁剪），self._context_cleared 被标记为 True。
+                            
+                            # 执行动作
+                            # 1 重置清空标记 self._context_cleared = False
+                            # 2 这条工具结果不按标准 role:tool 塞入，改用 role:user 包裹追加（OpenAI 协议上下文重置兼容写法）
+                            # 3 把全局熔断开关 oai_context_break = True
+                            # 4 break 跳出当前串行批次循环
+                            # 5 外层大循环检测到 oai_context_break=True，直接终止后面所有剩余工具批次不再执行
+                            # 设计目的
+                            # 上下文已经被大量裁剪、历史消息丢失，继续执行后续工具已经没有业务意义；强行终止工具队列，立刻把精简后的上下文丢给 LLM 进入下一轮思考，避免无效消耗 API 额度和磁盘 IO。
                             if self._context_cleared:
                                 self._context_cleared = False
                                 self._openai_messages.append({"role": "user", "content": res})
                                 oai_context_break = True
                                 break
-
+                            # 未触发清空则正常拼装消息
                             self._openai_messages.append(
                                 {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
 
             self._context_cleared = False
             self._refresh_runtime_system_prompt()
             await self._check_and_compact()
+            # 回到 while 顶部后，刚写入的 role=tool 结果会随完整历史再次发给模型。
 
     async def _call_openai_stream(self) -> dict:
+        """消费 OpenAI 流式分片，组装成协议循环易于处理的一条完整响应。"""
         async def _do():
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,
+                # schema 只告诉模型“可以请求哪些函数”；真正执行发生在 _execute_tool_call。
                 tools=_sanitize_for_utf8(_to_openai_tools(get_active_tool_definitions(self.tools))),
                 messages=_sanitize_for_utf8(self._openai_messages),
                 stream=True,
@@ -1795,6 +1926,7 @@ class Agent:
 
             content = ""
             first_text = True
+            # 一个响应可并行提出多个调用；index 用来把各调用交错到达的参数分片分别拼接。
             tool_calls: dict[int, dict] = {}
             finish_reason = ""
             usage = None
@@ -1811,6 +1943,7 @@ class Agent:
                 delta = chunk.choices[0].delta
 
                 if delta and delta.content:
+                    # 正文分片可边收边显示，同时累积起来写入 assistant 消息历史。
                     if first_text:
                         stop_spinner()
                         self._emit_text("\n")
@@ -1823,6 +1956,7 @@ class Agent:
                         existing = tool_calls.get(tc.index)
                         if existing:
                             if tc.function and tc.function.arguments:
+                                # 参数经常被拆成多段，例如 '{"path"' 和 ':"a.py"}'。
                                 existing["arguments"] += _safe_utf8_text(tc.function.arguments)
                         else:
                             tool_calls[tc.index] = {
@@ -1836,6 +1970,7 @@ class Agent:
 
             assembled = None
             if tool_calls:
+                # 恢复为非流式 Chat Completions 的 tool_calls 形状，简化外层协议循环。
                 assembled = [
                     {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
                     for _, tc in sorted(tool_calls.items())

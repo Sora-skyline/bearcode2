@@ -24,6 +24,10 @@ MCP 客户端模块。
         }
     }
 }
+
+阅读主线是 ``McpManager.load_and_connect`` -> ``McpConnection.initialize`` ->
+``list_tools`` -> ``McpManager.call_tool``。前半段把外部工具 schema 接入 Agent，后半段
+再按 ``mcp__server__tool`` 前缀把实际调用路由回正确子进程。
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ class McpConnection:
 
     def __init__(self, server_name: str, command: str, args: list[str] | None = None,
                  env: dict[str, str] | None = None):
+        """保存启动配置，并初始化请求 id、等待队列和后台读取任务状态。"""
         # MCP Server 在配置中的名称，用于后续生成工具名前缀和路由工具调用。
         self.server_name = server_name
         # 启动 MCP Server 的命令，例如 `node`、`python`、某个可执行文件路径等。
@@ -215,6 +220,7 @@ class McpManager:
     """
 
     def __init__(self):
+        """创建尚未连接的管理器；实际子进程在首次聊天时统一懒加载。"""
         # 已连接的 MCP Server。key 是 server name，value 是对应连接对象。
         self._connections: dict[str, McpConnection] = {}
         # 所有 MCP Server 发现出来的工具定义，保持接近 MCP 原始格式。
