@@ -1,3 +1,10 @@
+"""Skill 自进化的持久化、版本、审计和使用统计层。
+
+这里不判断“应该学什么”，只负责安全地创建/演化 SKILL.md，并维护 usage、provenance、
+history 与 stale pruning 数据。决策层在 ``online_skill_evolution``，质量评测层在
+``online_skill_eval``。
+"""
+
 from __future__ import annotations
 
 import json
@@ -20,6 +27,7 @@ HISTORY_DIR = "history"
 
 
 def get_evolution_dir() -> Path:
+    """返回当前项目隔离的在线演化数据目录。"""
     return Path.cwd() / ".bear" / "skill-evolution"
 
 
@@ -90,6 +98,8 @@ def record_skill_invocation(
     context: str,
     args: object = "",
 ) -> None:
+    """追加一次显式 Skill 调用事件，用于生命周期统计。"""
+    # 日志只保存参数预览，避免一次调用把大任务正文完整复制进生命周期文件。
     row = {
         "event": "invoke",
         "time": _utc_now(),
@@ -107,6 +117,8 @@ def record_skill_feedback(
     rating: str,
     note: str = "",
 ) -> None:
+    """记录用户对指定 Skill 的显式评分和备注。"""
+    # rating/note 是显式用户反馈，与后台 inferred usage judgment 分开保存。
     row = {
         "event": "feedback",
         "time": _utc_now(),
@@ -127,6 +139,8 @@ def record_online_skill_provenance(
     decision: dict[str, Any] | None = None,
     error: str = "",
 ) -> None:
+    """记录一次在线沉淀事件，并同步按 Skill 聚合的来源索引。"""
+    # 对话窗口先压缩再写审计日志，兼顾 replay 可用性和文件体积。
     row = {
         "event": "online_ingest",
         "time": _utc_now(),
@@ -139,6 +153,7 @@ def record_online_skill_provenance(
         "decision": decision or {},
         "error": _preview(error, 1200),
     }
+    # 原始 append-only 事件用于复盘；聚合索引用于按 Skill 快速读取 lineage。
     _append_jsonl(get_evolution_dir() / ONLINE_PROVENANCE_LOG, row)
     _update_online_provenance_index(row)
 
@@ -226,6 +241,7 @@ def _find_skill_file_by_name(base_dir: Path, skill_name: str) -> Path | None:
 
 
 def resolve_skill_file(skill_name: str, *, target: str = "active", active_dir: str = "") -> Path | None:
+    """按 active/project/user 目标定位 Skill 文件，供演化与审计使用。"""
     target = (target or "active").strip().lower()
     if target == "active" and active_dir:
         skill_file = Path(active_dir) / "SKILL.md"
@@ -296,16 +312,19 @@ def create_skill_file(
     actor: str = "agent",
     tags: list[str] | None = None,
 ) -> dict[str, Any]:
+    """创建新的目录式 Skill，并记录 create 生命周期事件和来源证据。"""
     resolved_name = str(name or "").strip()
     if not resolved_name:
         return {"ok": False, "error": "skill name is required"}
     if not str(description or "").strip():
         return {"ok": False, "error": "description is required"}
 
+    # active 范围已有同名 Skill 时必须走 evolve/merge，不能静默创建重复定义。
     existing = resolve_skill_file(resolved_name, target="active")
     if existing:
         return {"ok": False, "error": f"Skill already exists: {resolved_name}", "file": str(existing)}
 
+    # 目录名使用安全 slug，但 frontmatter 中保留面向用户展示的原始名称。
     root = _skills_root(target)
     skill_dir = root / _safe_skill_slug(resolved_name)
     skill_file = skill_dir / "SKILL.md"
@@ -328,10 +347,12 @@ def create_skill_file(
     if tools:
         meta["allowed-tools"] = tools
 
+    # 独占创建目录；并发创建同一 Skill 时后到者会失败而不是覆盖。
     skill_dir.mkdir(parents=True, exist_ok=False)
     body = _skill_body(instructions, evidence)
     skill_file.write_text(format_frontmatter(meta, body), encoding="utf-8")
 
+    # SKILL.md 成功写入后追加生命周期事件，评测层据此发现 lineage。
     event = {
         "event": "create",
         "time": _utc_now(),
@@ -379,6 +400,7 @@ def evolve_skill_file(
     when_to_use: str = "",
     tags: list[str] | None = None,
 ) -> dict[str, Any]:
+    """保存修改前快照、提升 patch 版本、追加演化说明并写回 Skill。"""
     skill_file = resolve_skill_file(skill_name, target=target, active_dir=active_dir)
     if not skill_file:
         return {"ok": False, "error": f"Skill not found: {skill_name}"}
@@ -388,6 +410,7 @@ def evolve_skill_file(
     meta = dict(parsed.meta)
     resolved_name = meta.get("name") or skill_file.parent.name
 
+    # 修改 active 文件之前完整保存旧文本，确保每次演化都可审计和人工恢复。
     snapshot = {
         "time": _utc_now(),
         "event": "snapshot",
@@ -402,6 +425,7 @@ def evolve_skill_file(
     history_path = get_evolution_dir() / HISTORY_DIR / f"{_safe_skill_slug(resolved_name)}.jsonl"
     _append_jsonl(history_path, snapshot)
 
+    # 每次演化只提升 patch 版本，同时维护最近演化时间和累计次数。
     meta["name"] = resolved_name
     meta["version"] = _bump_patch(meta.get("version"))
     meta["last-evolved"] = _utc_now()
@@ -421,11 +445,13 @@ def evolve_skill_file(
             meta["tags"] = ",".join(merged_tags[:12])
 
     if instructions.strip():
+        # Maintainer 给出完整指令时替换正文，但仍附加本次 Evolution Notes。
         new_body = _skill_body(instructions.strip())
         note = _append_evolution_note("", lesson, rationale).strip()
         if note:
             new_body = new_body.rstrip() + "\n\n" + note + "\n"
     else:
+        # 只有 durable lesson 时保留原正文，仅追加可追溯的演化说明。
         new_body = _append_evolution_note(parsed.body, lesson, rationale)
     skill_file.write_text(format_frontmatter(meta, new_body), encoding="utf-8")
 
@@ -446,6 +472,7 @@ def evolve_skill_file(
 
 
 def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, Any]:
+    """累计 retrieved/relevant/used 统计，并检查长期无效 Skill 是否需要归档。"""
     stats_path = get_evolution_dir() / SKILL_USAGE_STATS
     stats = _read_json(stats_path, {})
     pruned: list[str] = []
@@ -465,6 +492,7 @@ def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, A
                 "skill_dir": judgment.get("skill_dir", ""),
             },
         )
+        # retrieved 每次都累加；relevant 和 used 只在 judge 对应布尔值为真时累加。
         item["retrieved"] = int(item.get("retrieved", 0)) + 1
         item["last_retrieved"] = _utc_now()
         item["source"] = judgment.get("source", item.get("source", ""))
@@ -478,17 +506,21 @@ def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, A
         item["last_score"] = judgment.get("score", 0)
         if _maybe_prune_stale_skill(skill, item):
             pruned.append(skill)
+    # 主统计写盘后同步到 provenance 索引，lineage 报告可直接查看最新使用数据。
     _write_json(stats_path, stats)
     _sync_usage_into_provenance(stats)
     return {"ok": True, "judgments": len(judgments), "pruned": pruned}
 
 
 def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
+    """证据量达到环境阈值且长期未使用时，将 Skill 移入可审计归档目录。"""
     min_retrieved = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MIN_RETRIEVED"), 40)
     max_used = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MAX_USED"), 0)
     source = str(stats.get("source") or "").strip().lower()
+    # 默认只自动归档用户级 Skill；项目级必须显式开启环境变量。
     if source != "user" and os.environ.get("BEAR_SKILL_PRUNE_PROJECT", "").strip().lower() not in {"1", "true", "yes", "on"}:
         return False
+    # 达到最小观察量后，used 仍不超过阈值才被视为 stale。
     if int(stats.get("retrieved", 0)) < min_retrieved:
         return False
     if int(stats.get("used", 0)) > max_used:
@@ -502,6 +534,7 @@ def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
     archive_root.mkdir(parents=True, exist_ok=True)
     destination = archive_root / f"{_safe_skill_slug(skill_name)}-{int(time.time())}"
     try:
+        # 使用移动而非删除，保留完整 Skill 供审计或人工恢复。
         shutil.move(str(skill_dir), str(destination))
     except Exception:
         return False
@@ -535,6 +568,7 @@ def _sync_usage_into_provenance(stats: dict[str, Any]) -> None:
 
 
 def load_skill_stats() -> dict[str, dict[str, Any]]:
+    """合并生命周期日志、历史快照数和使用统计，构造按 Skill 聚合的视图。"""
     stats: dict[str, dict[str, Any]] = {}
     usage_path = get_evolution_dir() / USAGE_LOG
     if usage_path.is_file():
@@ -587,6 +621,7 @@ def load_skill_stats() -> dict[str, dict[str, Any]]:
 
 
 def format_skill_stats() -> str:
+    """将聚合统计格式化为 REPL 可读摘要。"""
     stats = load_skill_stats()
     if not stats:
         return "No skill evolution events recorded yet."

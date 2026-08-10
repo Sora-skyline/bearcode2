@@ -1,4 +1,8 @@
-"""System prompt construction — template embedded, variable interpolation, context gathering."""
+"""动态构建 Bear Code 的 system prompt。
+
+基础行为模板之外，还会拼接当前目录、日期/平台、Git、Memory 索引、Skills、子 Agent、
+deferred tools 和项目规则，因此 prompt 是 Runtime 能力快照，不是固定字符串。
+"""
 
 from __future__ import annotations
 
@@ -114,12 +118,14 @@ def _resolve_includes(
     visited: set[str] | None = None,
     depth: int = 0,
 ) -> str:
+    """递归展开规则文件中的 include，并用 visited/depth 防止循环引用。"""
     if depth >= _MAX_INCLUDE_DEPTH:
         return content
     if visited is None:
         visited = set()
 
     def _replace(m: _re.Match) -> str:
+        # include 相对路径以当前规则文件所在目录为基准，而不是固定以 cwd 为基准。
         raw = m.group(1)
         if raw.startswith("~/"):
             resolved = Path.home() / raw[2:]
@@ -130,12 +136,14 @@ def _resolve_includes(
         resolved = resolved.resolve()
         key = str(resolved)
         if key in visited:
+            # 用注释占位而不是抛错，让其余规则仍可正常加载并便于定位循环引用。
             return f"<!-- circular: {raw} -->"
         if not resolved.is_file():
             return f"<!-- not found: {raw} -->"
         try:
             visited.add(key)
             included = resolved.read_text()
+            # 被包含文件可以继续 include，直到深度上限或命中 visited。
             return _resolve_includes(included, resolved.parent, visited, depth + 1)
         except Exception:
             return f"<!-- error reading: {raw} -->"
@@ -144,11 +152,12 @@ def _resolve_includes(
 
 
 def _load_rules_dir(directory: Path) -> str:
-    """Load all .md files from .bear/rules/ directory."""
+    """按稳定顺序读取一个规则目录下可注入的 Markdown 规则。"""
     rules_dir = directory / ".bear" / "rules"
     if not rules_dir.is_dir():
         return ""
     try:
+        # 文件名排序保证同一工作区每次构建 prompt 时规则顺序稳定。
         files = sorted(f for f in rules_dir.iterdir() if f.suffix == ".md" and f.is_file())
         if not files:
             return ""
@@ -166,10 +175,11 @@ def _load_rules_dir(directory: Path) -> str:
 
 
 def load_claude_md() -> str:
-    """Walk up from cwd collecting all CLAUDE.md files, resolving @includes."""
+    """加载用户级和项目级规则文件，作为最终 system prompt 的项目约束。"""
     parts: list[str] = []
     d = Path.cwd().resolve()
     while True:
+        # 从 cwd 一直向上查找 CLAUDE.md；父级规则插到前面，项目规则随后覆盖/补充。
         f = d / "CLAUDE.md"
         if f.is_file():
             try:
@@ -182,7 +192,7 @@ def load_claude_md() -> str:
         if parent == d:
             break
         d = parent
-    # Load .bear/rules/*.md from cwd
+    # .bear/rules 只从当前项目目录读取，用于拆分较大的项目级规则集。
     rules = _load_rules_dir(Path.cwd())
     claude_md = ""
     if parts:
@@ -191,7 +201,7 @@ def load_claude_md() -> str:
 
 
 def get_git_context() -> str:
-    """Get git branch, recent commits, and status."""
+    """获取分支与仓库状态摘要；非 Git 目录或命令失败时静默返回空串。"""
     try:
         opts = {"encoding": "utf-8", "timeout": 3, "capture_output": True}
         branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **opts).stdout.strip()
@@ -208,11 +218,12 @@ def get_git_context() -> str:
 
 
 def build_system_prompt() -> str:
-    """Build the full system prompt from embedded template + dynamic context."""
+    """组装当前运行环境的完整 system prompt。"""
     from datetime import date
     today = date.today().isoformat()
     plat = f"{platform.system()} {platform.machine()}"
     shell = (os.environ.get("ComSpec") or "cmd.exe") if sys.platform == "win32" else os.environ.get("SHELL", "/bin/sh")
+    # 这些片段分别由能力模块生成，任何模块缓存刷新后都可重新构建 prompt 快照。
     git_context = get_git_context()
     claude_md = load_claude_md()
     memory_section = build_memory_prompt_section()
@@ -220,11 +231,13 @@ def build_system_prompt() -> str:
     agent_section = build_agent_descriptions()
 
     deferred_names = get_deferred_tool_names()
+    # deferred 工具只暴露名称；模型先调用 tool_search，下一轮才获得完整 schema。
     deferred_section = (
         f"\n\nThe following deferred tools are available via tool_search: {', '.join(deferred_names)}. Use tool_search to fetch their full schemas when needed."
         if deferred_names else ""
     )
 
+    # 模板占位符集中替换，避免各能力模块直接修改基础 system prompt。
     replacements = {
         "{{cwd}}": str(Path.cwd()),
         "{{date}}": today,

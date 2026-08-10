@@ -1,16 +1,21 @@
-"""Shared YAML frontmatter parser for memory and skills files.
-Handles simple `key: value` pairs between `---` delimiters."""
+"""Memory、Skill 与自定义 Agent 共用的轻量 frontmatter 编解码器。
+
+这里只支持 ``---`` 之间的简单 ``key: value``，不是完整 YAML 实现；保持依赖最小的
+同时，也意味着列表和嵌套结构需要由上层自行解析。
+"""
 
 from dataclasses import dataclass, field
 
 
 @dataclass
 class FrontmatterResult:
+    """解析后的元数据和去除 frontmatter 的 Markdown 正文。"""
     meta: dict[str, str] = field(default_factory=dict)
     body: str = ""
 
 
 def parse_frontmatter(content: str) -> FrontmatterResult:
+    """解析首个 frontmatter 区块；格式不完整时把原文全部视为正文。"""
     lines = content.split("\n")
     if not lines or lines[0].strip() != "---":
         return FrontmatterResult(body=content)
@@ -38,6 +43,7 @@ def parse_frontmatter(content: str) -> FrontmatterResult:
 
 
 def format_frontmatter(meta: dict[str, str], body: str) -> str:
+    """将扁平元数据与正文格式化为可落盘的 Markdown 文本。"""
     lines = ["---"]
     for key, value in meta.items():
         lines.append(f"{key}: {value}")

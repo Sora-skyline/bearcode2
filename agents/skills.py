@@ -1,3 +1,10 @@
+"""Skill 的发现、检索、提示词展开、执行与维护入口。
+
+Skill 是可复用的方法/流程，而不是事实记忆。用户级与项目级 ``SKILL.md`` 被解析为
+``SkillDefinition``；检索只负责提示“可能相关”，显式调用才会返回完整 prompt 或 fork
+配置。创建、演化和使用统计的实际落盘由 ``skill_evolution`` 完成。
+"""
+
 from __future__ import annotations
 
 import json
@@ -22,7 +29,7 @@ from .skill_evolution import (
 
 @dataclass
 class SkillDefinition:
-    # 一个 skill 在程序内的统一表示，由 SKILL.md 的 frontmatter 和正文解析得到。
+    """一个 Skill 在 Runtime 内的统一表示，由 frontmatter 与 Markdown 正文组成。"""
     name: str
     description: str
     when_to_use: str | None = None
@@ -39,11 +46,13 @@ _cached_skills: list[SkillDefinition] | None = None
 
 
 def execute_skill(skill_name:str, args:object)-> dict | None:
-    # skill 工具的执行入口：按名字找到 skill，并返回解析后的 prompt 和执行配置。
+    """解析一次显式 Skill 调用并记录 invocation；真正的 fork 由 Agent 执行。"""
+    # 这里只解析 Skill，不决定 inline/fork；执行方式由 Agent._execute_skill_tool 处理。
     skill = get_skill_by_name(skill_name)
     if not skill:
         return None
 
+    # 每次显式调用都会进入 usage.jsonl，和“对话前自动检索”统计分开记录。
     record_skill_invocation(
         skill_name=skill.name,
         source=skill.source,
@@ -62,6 +71,7 @@ def execute_skill(skill_name:str, args:object)-> dict | None:
 
 
 def resolve_skill_prompt(skill: SkillDefinition, args: object) -> str:
+    """展开调用参数和 Skill 目录占位符，得到本次实际执行的 prompt。"""
     import re
     prompt = skill.prompt_template
     # 支持在 SKILL.md 正文中使用 $ARGUMENTS 或 ${ARGUMENTS} 引用用户参数。
@@ -78,8 +88,10 @@ def get_skill_by_name(skill_name:str)->SkillDefinition | None:
     return None
 
 def discover_skills() -> list[SkillDefinition]:
+    """扫描用户级和项目级 Skill 并缓存结果；同名时用户级定义优先。"""
     global _cached_skills
     if _cached_skills is not None:
+        # Skill 创建、演化、归档后由对应入口主动 reset，普通请求复用进程内缓存。
         return _cached_skills
 
     skills: dict[str,SkillDefinition] = {}
@@ -94,6 +106,7 @@ def discover_skills() -> list[SkillDefinition]:
     return _cached_skills
 
 def _load_skills_from_dir( base_dir: Path, source: str, skills:dict[str, SkillDefinition], overwrite: bool = True) -> None:
+    """加载 ``<base>/<skill>/SKILL.md``，通过 overwrite 控制同名覆盖策略。"""
     # 只加载目录形式的 skill，不加载 .bear/skills/foo.md 这种单文件形式。
     if not base_dir.is_dir():
         return
@@ -112,6 +125,7 @@ def _load_skills_from_dir( base_dir: Path, source: str, skills:dict[str, SkillDe
             skills[skill.name] = skill
 
 def _parse_skill_file(file_path: Path, source: str, skill_dir: str) -> SkillDefinition:
+    """把 SKILL.md 的 frontmatter 和正文转换为 SkillDefinition。"""
     try:
         # SKILL.md = frontmatter 配置 + markdown 正文。
         raw = file_path.read_text()
@@ -152,6 +166,7 @@ def _parse_skill_file(file_path: Path, source: str, skill_dir: str) -> SkillDefi
 
 
 def build_skill_descriptions() -> str:
+    """生成 system prompt 中的轻量 Skill 清单，不展开完整正文。"""
     # 把已加载的 skills 写进 system prompt，让模型知道哪些 skill 可用。
     skills = discover_skills()
 
@@ -258,7 +273,13 @@ def retrieve_relevant_skills(
     limit: int = 3,
     min_score: float = 0.08,
 ) -> list[dict[str, Any]]:
+    """使用轻量 BM25 风格词项匹配检索相关 Skill。
+
+    元数据权重高于正文；中文补充二元切分，英文做基础词法归一化。结果只是候选，
+    Runtime 仍要求模型根据用户意图决定是否采用。
+    """
     query_terms = _token_list(query)
+    # set 用于计算唯一词项交集；list 保留查询长度用于后续得分归一化。
     query_tokens = set(query_terms)
     if not query_tokens:
         return []
@@ -266,7 +287,9 @@ def retrieve_relevant_skills(
     docs: list[tuple[SkillDefinition, list[str]]] = []
     document_frequency: Counter[str] = Counter()
     for skill in discover_skills():
+        # 元数据重复三次，相当于给名称、描述和触发条件高于正文的检索权重。
         meta_terms = _token_list("\n".join([skill.name, skill.description, skill.when_to_use or ""]))
+        # 正文只取前 2500 字符，限制大型 SKILL.md 对检索成本和得分的影响。
         body_terms = _token_list(skill.prompt_template[:2500])
         terms = (meta_terms * 3) + body_terms
         if not terms:
@@ -289,10 +312,12 @@ def retrieve_relevant_skills(
         raw_score = 0.0
         doc_len = max(1, len(terms))
         for token in overlap:
+            # BM25：tf 表示文档词频，idf 提升稀有词，长度项抑制长正文偏置。
             tf = term_counts[token]
             idf = math.log(1 + (doc_count - document_frequency[token] + 0.5) / (document_frequency[token] + 0.5))
             denom = tf + k1 * (1 - b + b * doc_len / max(1.0, avg_doc_len))
             raw_score += idf * (tf * (k1 + 1)) / max(denom, 0.0001)
+        # 用户直接写出 Skill 名称时额外加分，但最终分数限制在 1.0。
         name_bonus = 0.15 if skill.name.lower() in str(query or "").lower() else 0.0
         score = min(1.0, (raw_score / max(3.0, len(query_tokens))) + name_bonus)
         if score < float(min_score):
@@ -310,11 +335,13 @@ def retrieve_relevant_skills(
             }
         )
 
+    # 只返回超过阈值的前 limit 项，供 chat() 生成 <retrieved_skills> 注入块。
     hits.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
     return hits[: max(1, int(limit or 1))]
 
 
 def format_retrieved_skill_context(query: str, *, limit: int = 3) -> tuple[str, dict[str, Any] | None]:
+    """将命中格式化为运行时注入块，并返回最高分引用及全部命中证据。"""
     hits = retrieve_relevant_skills(query, limit=limit)
     if not hits:
         return "", None
@@ -330,12 +357,13 @@ def format_retrieved_skill_context(query: str, *, limit: int = 3) -> tuple[str, 
             lines.append(f"   When to use: {hit['when_to_use']}")
     lines.append("</retrieved_skills>")
     top = dict(hits[0])
+    # top_ref 用于关联上一轮身份；all_hits 用于逐项记录 retrieved/relevant/used。
     top["all_hits"] = hits
     return "\n".join(lines), top
 
 
 def reset_skill_cache() -> None:
-    # 测试或运行中刷新 skills 时使用；普通用户通常重启程序即可。
+    """清空发现缓存，使新建、演化或归档后的 Skill 可被立即重新加载。"""
     global _cached_skills
     _cached_skills = None
 
@@ -350,6 +378,7 @@ def evolve_skill(
     when_to_use: str = "",
     tags: list[str] | None = None,
 ) -> dict:
+    """手动演化入口：解析目标 Skill 后委托持久化层保存快照和新版本。"""
     skill = get_skill_by_name(skill_name)
     result = evolve_skill_file(
         skill_name=skill_name,
@@ -363,6 +392,7 @@ def evolve_skill(
         tags=tags,
     )
     if result.get("ok"):
+        # 落盘成功后丢弃发现缓存，Runtime 刷新 prompt 时会读到新版本。
         reset_skill_cache()
     return result
 
@@ -380,6 +410,7 @@ def create_skill(
     actor: str = "agent",
     tags: list[str] | None = None,
 ) -> dict:
+    """手动创建入口：封装 Skill 元数据后委托持久化层写入 SKILL.md。"""
     result = create_skill_file(
         name=name,
         description=description,
@@ -394,6 +425,7 @@ def create_skill(
         tags=tags,
     )
     if result.get("ok"):
+        # 新目录只有清缓存后才会被 discover_skills 纳入当前进程。
         reset_skill_cache()
     return result
 
@@ -428,6 +460,7 @@ def skill_stats() -> str:
 
 
 def record_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, Any]:
+    """写入检索 Skill 的 relevant/used 判断，并在归档发生后刷新发现缓存。"""
     result = record_skill_usage_judgments(judgments)
     if result.get("pruned"):
         reset_skill_cache()

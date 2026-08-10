@@ -1,4 +1,8 @@
-"""CLI entry point and interactive REPL — mirrors cli.ts."""
+"""Bear Code 的 CLI 入口与交互式 REPL。
+
+本模块只负责把命令行、环境变量和用户输入转换成 ``Agent`` 的运行配置；模型循环、
+工具执行和持久化能力由其他模块实现。入口同时支持一次性 prompt 与持续 REPL。
+"""
 
 from __future__ import annotations
 
@@ -40,6 +44,7 @@ from .online_skill_eval import format_online_skill_eval_async
 
 
 def parse_args() -> argparse.Namespace:
+    """解析启动模式、模型协议、预算、恢复会话和一次性 prompt 参数。"""
     parser = argparse.ArgumentParser(
         prog="mini-claude",
         description="Bear Code — a minimal coding agent",
@@ -61,6 +66,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _resolve_permission_mode(args: argparse.Namespace) -> str:
+    """按高优先级 CLI 开关映射出 Runtime 使用的权限模式名称。"""
     if args.yolo:
         return "bypassPermissions"
     if args.plan:
@@ -96,6 +102,12 @@ def _is_anthropic_compatible_base_url(base_url: str | None) -> bool:
 
 
 def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | None, bool]:
+    """合并 CLI/环境变量，并返回 ``(base_url, api_key, use_openai)``。
+
+    Bear Code 以 base URL 和显式厂商变量推断兼容协议；该布尔值最终决定 Agent 创建
+    OpenAI-compatible 还是 Anthropic-compatible 客户端。
+    """
+    # 通用变量兼容 Bear Code 早期配置；厂商变量用于明确指定协议客户端。
     generic_api_key = _clean_env(os.environ.get("APIKEY")) or _clean_env(os.environ.get("MINI_CLAUDE_API_KEY"))
     openai_api_key = _clean_env(os.environ.get("OPENAI_API_KEY"))
     anthropic_api_key = _clean_env(os.environ.get("ANTHROPIC_API_KEY"))
@@ -104,27 +116,31 @@ def _resolve_api_config(cli_api_base: str | None) -> tuple[str | None, str | Non
     openai_api_base = _clean_env(os.environ.get("OPENAI_BASE_URL"))
     anthropic_api_base = _clean_env(os.environ.get("ANTHROPIC_BASE_URL"))
 
+    # CLI --api-base 优先级最高，其后依次尝试通用、OpenAI、Anthropic 环境变量。
     resolved_api_base = _clean_env(cli_api_base) or generic_api_base or openai_api_base or anthropic_api_base
 
     if resolved_api_base:
+        # URL 路径显式包含 /anthropic 时走 Anthropic-compatible，其余自定义地址默认 OpenAI-compatible。
         if _is_anthropic_compatible_base_url(resolved_api_base):
             return resolved_api_base, generic_api_key or anthropic_api_key or openai_api_key, False
         return resolved_api_base, generic_api_key or openai_api_key or anthropic_api_key, True
 
     if anthropic_api_key or anthropic_api_base:
+        # 未显式给 base URL 时，厂商专用变量直接决定协议。
         return anthropic_api_base, generic_api_key or anthropic_api_key or openai_api_key, False
 
     if openai_api_key or openai_api_base:
         return openai_api_base, generic_api_key or openai_api_key or anthropic_api_key, True
 
     if generic_api_key:
+        # 只有历史通用 key 时保持原有行为，回落到 Anthropic-compatible 默认端点。
         return None, generic_api_key, False
 
     return None, None, False
 
 
 async def run_repl(agent: Agent) -> None:
-    """Interactive REPL loop."""
+    """运行交互循环，并在入口层处理不需要模型参与的斜杠命令。"""
 
     async def confirm_fn(message: str) -> bool:
         try:
@@ -182,6 +198,7 @@ async def run_repl(agent: Agent) -> None:
     print_welcome()
 
     while True:
+        # 每次循环先交给入口层识别 exit、内置命令和 /skill；其余文本才进入 Agent.chat。
         print_user_prompt()
         try:
             line = input()
@@ -198,7 +215,7 @@ async def run_repl(agent: Agent) -> None:
             print_goodbye()
             break
 
-        # REPL commands
+        # 这些 REPL 命令直接操作 Runtime 状态或本地数据，不需要额外消耗一次主模型调用。
         if inp == "/clear":
             agent.clear_history()
             continue
@@ -232,6 +249,7 @@ async def run_repl(agent: Agent) -> None:
             print_info(skill_stats())
             continue
         if inp == "/skill-eval":
+            # REPL 能访问 Agent 客户端，因此传入 side_query 启用 LLM judge 和候选试跑。
             side_query = agent._build_side_query(max_tokens=2400)
             print_info(await format_online_skill_eval_async(side_query=side_query))
             continue
@@ -287,7 +305,7 @@ async def run_repl(agent: Agent) -> None:
                 print_error(str(result.get("error") or result))
             continue
 
-        # Skill invocation: /<skill-name> [args]
+        # 剩余斜杠命令按 /<skill-name> [args] 尝试解析为用户显式 Skill 调用。
         if inp.startswith("/"):
             space_idx = inp.find(" ")
             cmd_name = inp[1:space_idx] if space_idx > 0 else inp[1:]
@@ -297,8 +315,10 @@ async def run_repl(agent: Agent) -> None:
                 print_info(f"Invoking skill: {skill.name}")
                 try:
                     if skill.context == "fork":
+                        # fork Skill 需要主模型调用 skill 工具，以便 Runtime 创建隔离子 Agent。
                         await agent.chat(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
                     else:
+                        # inline Skill 直接展开 prompt，再作为一次普通用户输入交给 Agent。
                         result = execute_skill(skill.name, cmd_args)
                         if not result:
                             print_error(f"Unknown skill: {skill.name}")
@@ -319,6 +339,7 @@ async def run_repl(agent: Agent) -> None:
 
 
 async def run_one_shot(agent: Agent, prompt: str) -> None:
+    """执行一次用户任务，并等待本轮派生的后台 Skill 任务结束后退出。"""
     await agent.chat(prompt)
     await agent.drain_background_skill_tasks()
 

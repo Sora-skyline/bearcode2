@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""内置工具、deferred tool 激活与权限判定。
+
+模型看到的 schema 定义在 ``tool_definitions``；``check_permission`` 只做授权决策，
+``execute_tool`` 才执行动作。子 Agent、Skill、MCP 和 Plan Mode 的特殊路由留在
+``agents.agent``，以避免工具模块反向依赖整个 Runtime。
+"""
+
 from __future__ import annotations
 
 import fnmatch
@@ -231,6 +238,7 @@ tool_definitions: list[ToolDef] = [
 #----------------------工具调用----------------------------
 
 def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
+    """解析模型给出的路径，并兼容带多余绝对路径前缀的工作区文件名。"""
     path = Path(raw_path)
     if path.exists() or not path.is_absolute():
         return path
@@ -273,6 +281,7 @@ def _write_file(inp:dict) -> str:
         return f"Error writing file: {e}"
 
 def _auto_update_memory_index(file_path:str) -> None:
+    """直接编辑 memory Markdown 后同步重建 MEMORY.md 索引。"""
     try:
         mem_dir = str(get_memory_dir())
         if file_path.startswith(mem_dir) and file_path.endswith(".md") and not file_path.endswith("MEMORY.md"):
@@ -480,6 +489,7 @@ def reset_activated_tools() -> None:
     _activated_tools.clear()
 
 def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
+    """返回普通工具和已激活 deferred 工具，并移除内部 ``deferred`` 元数据。"""
     tools = all_tools if all_tools is not None else tool_definitions
     return [
         {k: v for k, v in t.items() if k != "deferred"}
@@ -488,6 +498,7 @@ def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[
     ]
 
 def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]:
+    """列出尚未激活的 deferred 工具名称，供 system prompt 提示模型搜索。"""
     tools = all_tools if all_tools is not None else tool_definitions
     return [t["name"] for t in tools if t.get("deferred") and t["name"] not in _activated_tools]
 
@@ -558,13 +569,16 @@ _cached_rules: dict | None = None
 
 
 def load_permission_rules() -> dict:
+    """合并用户级与项目级 allow/deny 规则并缓存；最终判定时 deny 优先。"""
     global _cached_rules
+    # 规则文件在一次进程内通常不变，缓存可避免每个 tool call 都重复读盘。
     if _cached_rules is not None:
         return _cached_rules
 
     allow: list[dict] = []
     deny: list[dict] = []
 
+    # 用户级先读、项目级后读，但最终匹配时统一 deny 优先于 allow。
     user_settings = _load_settings(Path.home() / ".bear" / "settings.json")
     project_settings = _load_settings(Path.cwd() / ".bear" / "settings.json")
 
@@ -603,6 +617,7 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
 
 def _check_permission_rules(tool_name: str, inp: dict) -> str | None:
     rules = load_permission_rules()
+    # deny 必须先检查，避免同一调用同时命中 allow 时被意外放行。
     for rule in rules["deny"]:
         if _matches_rule(rule, tool_name, inp):
             return "deny"
@@ -618,10 +633,16 @@ def check_permission(
     mode: str = "default",
     plan_file_path: str | None = None,
 ) -> dict:
-    """Returns {"action": "allow"|"deny"|"confirm", "message": ...}"""
+    """根据规则、权限模式和操作风险返回 allow、deny 或 confirm。
+
+    本函数不执行确认交互；它只返回决策，主 Agent 再通过 ``confirm_fn`` 向用户询问。
+    Plan Mode 仅允许只读工具及指定 plan 文件，``bypassPermissions`` 则最先放行。
+    """
     if mode == "bypassPermissions":
+        # yolo 模式最高优先级：跳过配置规则和内置风险判断。
         return {"action": "allow"}
 
+    # 显式设置规则优先于默认工具分类和权限模式。
     rule_result = _check_permission_rules(tool_name, inp)
     if rule_result == "deny":
         return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
@@ -629,11 +650,13 @@ def check_permission(
         return {"action": "allow"}
 
     if tool_name in READ_TOOLS:
+        # 只读内置工具默认放行，是 Agent 探索代码库的最小能力。
         return {"action": "allow"}
 
     if mode == "plan":
         if tool_name in EDIT_TOOLS:
             file_path = inp.get("file_path") or inp.get("path")
+            # Plan Mode 的唯一写例外是 Runtime 自动生成的当前 plan 文件。
             if plan_file_path and file_path == plan_file_path:
                 return {"action": "allow"}
             return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
@@ -644,6 +667,7 @@ def check_permission(
         return {"action": "allow"}
 
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
+        # acceptEdits 自动批准编辑类动作，Shell 仍继续走危险模式判断。
         return {"action": "allow"}
 
     needs_confirm = False
@@ -667,6 +691,7 @@ def check_permission(
 
     if needs_confirm:
         if mode == "dontAsk":
+            # CI 场景不能阻塞等待输入，因此所有需确认操作都自动拒绝。
             return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
         return {"action": "confirm", "message": confirm_message}
 
@@ -683,9 +708,15 @@ def check_permission(
 async def execute_tool(
     name: str, inp: dict, read_file_state: dict[str, float] | None = None
 ) -> str:
+    """执行一个内置工具，并实施编辑前读取和文件 mtime 一致性保护。
+
+    ``read_file_state`` 记录模型最近读取的文件版本：写已有文件前必须先读，且外部修改
+    后必须重新读取。``tool_search`` 在这里激活 deferred schema，而不执行目标工具。
+    """
     if name == "read_file":
         result = _read_file(inp)
         if read_file_state is not None and not result.startswith("Error"):
+            # 保存读取时的 mtime，后续 write/edit 用它判断模型看到的内容是否仍为最新版本。
             abs_path = str(_resolve_tool_path(inp["file_path"]).resolve())
             try:
                 read_file_state[abs_path] =  os.path.getmtime(abs_path)
@@ -697,9 +728,11 @@ async def execute_tool(
         abs_path = str(_resolve_tool_path(inp["file_path"], must_exist=(name == "edit_file")).resolve())
         if os.path.exists(abs_path):
             if abs_path not in read_file_state:
+                # 禁止模型在未查看当前内容时覆盖已有文件。
                 verb = "writing" if name == "write_file" else "editing"
                 return f"Error: You must read this file before {verb}. Use read_file first to see its current contents."
             if os.path.getmtime(abs_path) != read_file_state[abs_path]:
+                # 读取后被用户或其他进程修改时，要求重读以避免覆盖并发改动。
                 verb = "writing" if name == "write_file" else "editing"
                 return f"Warning: {inp['file_path']} was modified externally since your last read. Please read_file again before {verb}."
 
@@ -715,6 +748,7 @@ async def execute_tool(
             return "No matching deferred tools found."
 
         for m in matches:
+            # 激活状态是进程内集合；下一轮 get_active_tool_definitions 会真正暴露 schema。
             _activated_tools.add(m["name"])
 
         return json.dumps(
@@ -761,9 +795,10 @@ async def execute_tool(
     if not handler:
         return f"Unknown tool: {name}"
 
+    # 统一截断普通工具输出，避免单次结果直接占满模型上下文。
     result = _truncate_result(handler(inp))
 
-    # 更新时间
+    # 写入成功后刷新 mtime 基线，使同一 Agent 可以基于自己刚写的版本继续编辑。
     if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):
         abs_path = str(_resolve_tool_path(inp["file_path"], must_exist=False).resolve())
         try:
@@ -778,6 +813,3 @@ async def execute_tool(
 def reset_permission_cache() -> None:
     global _cached_rules
     _cached_rules = None
-
-
-

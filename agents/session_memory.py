@@ -1,4 +1,9 @@
-"""Session-scoped structured memory folding for conversation compaction."""
+"""把长对话折叠为可继续执行任务的结构化 Session Memory。
+
+本模块只负责协议消息转录、折叠结果校验和上下文注入格式，不直接调用模型或写文件。
+OpenAI 与 Anthropic 历史先转成统一的可读 transcript，再由 Agent 的 side query 生成
+episode、working、tool 三类记忆；模型输出异常时回退为截断后的原始转录。
+"""
 
 from __future__ import annotations
 
@@ -53,6 +58,7 @@ Guidelines:
 
 
 def _clip(text: str, limit: int = MAX_BLOCK_CHARS) -> str:
+    """头尾各保留一部分文本，避免单个消息块挤占整个折叠请求。"""
     text = str(text or "")
     if len(text) <= limit:
         return text
@@ -61,6 +67,7 @@ def _clip(text: str, limit: int = MAX_BLOCK_CHARS) -> str:
 
 
 def _content_text(content: Any) -> str:
+    """把字符串或 Anthropic content blocks 规范化为带工具语义的纯文本。"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -92,6 +99,7 @@ def _content_text(content: Any) -> str:
 
 
 def build_openai_transcript(messages: list[dict[str, Any]]) -> str:
+    """将 OpenAI 消息、tool_calls 和 tool_call_id 串成折叠用转录。"""
     parts: list[str] = []
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
@@ -122,6 +130,7 @@ def build_openai_transcript(messages: list[dict[str, Any]]) -> str:
 
 
 def build_anthropic_transcript(messages: list[dict[str, Any]]) -> str:
+    """将 Anthropic 的 text/tool_use/tool_result blocks 串成折叠用转录。"""
     parts: list[str] = []
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
@@ -134,6 +143,7 @@ def build_anthropic_transcript(messages: list[dict[str, Any]]) -> str:
 
 
 def build_folding_user_prompt(transcript: str) -> str:
+    """把规范化转录包装为结构化记忆生成请求。"""
     return (
         "Compact the following coding-agent conversation into the required structured session memory JSON.\n\n"
         "Conversation transcript:\n"
@@ -142,6 +152,7 @@ def build_folding_user_prompt(transcript: str) -> str:
 
 
 def _extract_json_text(text: str) -> str:
+    """兼容纯 JSON、Markdown 代码块或前后带解释文本的模型输出。"""
     text = str(text or "").strip()
     fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if fenced:
@@ -159,6 +170,7 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def parse_folded_memory(text: str) -> dict[str, Any]:
+    """解析并收窄折叠结果，只保留约定的三段结构和已知字段。"""
     parsed = json.loads(_extract_json_text(text))
     if not isinstance(parsed, dict):
         raise ValueError("folded memory is not a JSON object")
@@ -186,6 +198,7 @@ def parse_folded_memory(text: str) -> dict[str, Any]:
 
 
 def fallback_folded_memory(transcript: str) -> dict[str, Any]:
+    """模型调用或 JSON 解析失败时，用截断转录生成最小可继续状态。"""
     return {
         "episode_memory": {
             "task_description": "Previous conversation was compacted without structured JSON.",
@@ -202,6 +215,7 @@ def fallback_folded_memory(transcript: str) -> dict[str, Any]:
 
 
 def format_folded_memory(memory: dict[str, Any]) -> str:
+    """用边界标签包装结构化记忆，作为压缩后的新用户上下文。"""
     return (
         "<session-folded-memory>\n"
         "Previous raw conversation history was compacted. Use this structured memory as session state, "

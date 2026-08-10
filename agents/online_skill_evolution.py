@@ -1,3 +1,10 @@
+"""从真实对话和下一轮反馈中抽取、维护在线 Skill 候选。
+
+本模块是“决策层”：Extractor 判断是否存在稳定可复用经验，Maintainer 决定 add、merge
+或 discard，``online_ingest`` 编排权限与 provenance。文件写入、历史快照和统计由
+``skill_evolution`` 负责。
+"""
+
 from __future__ import annotations
 
 import json
@@ -12,6 +19,7 @@ ConfirmWrite = Callable[[str], Awaitable[bool]]
 
 @dataclass
 class OnlineSkillCandidate:
+    """Extractor 返回的结构化候选；evidence 保留形成该规则的简短依据。"""
     name: str
     description: str
     when_to_use: str = ""
@@ -85,6 +93,7 @@ async def extract_online_skill_candidate(
     retrieved_reference: dict[str, Any] | None = None,
     hint: str = "",
 ) -> OnlineSkillCandidate | None:
+    """让 side query 从“任务、回答、下一轮反馈”中抽取耐久且可复用的 Skill。"""
     system = (
         "You are Bear Code's online Skill Extractor.\n"
         "Extract at most ONE reusable skill candidate from a live conversation window.\n"
@@ -100,10 +109,12 @@ async def extract_online_skill_candidate(
         "- If evidence is weak, generic, or low-value, return {\"skills\": []}.\n"
     )
     payload = {
+        # retrieved_reference 只帮助识别“是否在改已有 Skill”，不能替代真实用户证据。
         "messages": messages,
         "hint": hint,
         "retrieved_reference": retrieved_reference or None,
     }
+    # 解析失败或空 skills 都按“没有可靠候选”处理，不让不稳定输出触发落盘。
     parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
     skills = parsed.get("skills")
     if not isinstance(skills, list) or not skills:
@@ -115,6 +126,7 @@ async def extract_online_skill_candidate(
 
 
 def _exact_identity_match(candidate: OnlineSkillCandidate, skills: list[Any]) -> str:
+    """用规范化名称/描述发现确定性同一 Skill，减少不必要的 LLM merge 判断。"""
     candidate_ids = {
         _normalize_identity(candidate.name),
         _normalize_identity(candidate.description),
@@ -141,8 +153,10 @@ async def maintain_online_skill_candidate(
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
 ) -> dict[str, Any]:
+    """比较候选与现有 Skills，返回 add、merge 或 discard 的维护决策。"""
     from .skills import create_skill, discover_skills, evolve_skill, retrieve_relevant_skills
 
+    # 先做确定性身份匹配，再把相似检索结果交给 Maintainer，降低重复 Skill 概率。
     skills = discover_skills()
     exact_target = _exact_identity_match(candidate, skills)
     similar_hits = retrieve_relevant_skills(_candidate_search_text(candidate), limit=8, min_score=0.03)
@@ -180,28 +194,33 @@ async def maintain_online_skill_candidate(
         ],
     }
 
+    # LLM 只提出集合维护决策，下面仍会用确定性规则修正并经过权限确认。
     decision = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
     action = str(decision.get("action") or "").strip().lower()
     target_skill = str(decision.get("target_skill") or "").strip()
 
     if exact_target:
+        # 名称、描述或触发条件完全匹配时强制 merge，避免重复 add。
         action = "merge"
         target_skill = exact_target
     elif action == "add" and similar_hits:
         top = similar_hits[0]
         if float(top.get("score", 0.0)) >= 0.55:
+            # 高相似候选即使 LLM 建议 add，也保守合并到最高分已有 Skill。
             action = "merge"
             target_skill = str(top.get("name") or "")
     elif action == "merge" and not target_skill:
         target_skill = top_reference_name
 
     if action not in {"add", "merge", "discard"}:
+        # 非法或缺失动作默认 discard，保证异常模型输出不会触发写文件。
         action = "discard"
 
     if action == "discard":
         return {"ok": True, "action": "discard", "skill": "", "decision": decision}
 
     write_summary = f"online skill evolution: {action} {target_skill or candidate.name}"
+    # Maintainer 只给建议；真正 add/merge 前仍需通过 Runtime 提供的写权限回调。
     if confirm_write is not None and not await confirm_write(write_summary):
         return {
             "ok": False,
@@ -215,6 +234,7 @@ async def maintain_online_skill_candidate(
         target_skill = target_skill or top_reference_name
         if not target_skill:
             return {"ok": False, "action": "merge", "error": "missing target_skill", "decision": decision}
+        # merge 委托持久化层保存旧快照并提升版本，不做无历史覆盖。
         result = evolve_skill(
             skill_name=target_skill,
             lesson=candidate.evidence or candidate.description,
@@ -227,6 +247,7 @@ async def maintain_online_skill_candidate(
         )
         return {"action": "merge", "candidate": asdict(candidate), "decision": decision, **result}
 
+    # add 默认生成项目级、不可由用户斜杠直接调用的 inline Skill。
     result = create_skill(
         name=candidate.name,
         description=candidate.description,
@@ -251,9 +272,15 @@ async def online_ingest(
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
 ) -> dict[str, Any]:
+    """在线自进化总入口：抽取候选、维护集合、请求写权限并记录全程审计。
+
+    无论候选为空、被丢弃、拒绝、失败还是成功 add/merge，都会记录 provenance，确保
+    后续 replay 评测能追溯 Skill 从哪段真实对话产生。
+    """
     from .skills import record_online_provenance
 
     try:
+        # 第一步只抽取结构化候选，Extractor 本身没有文件写权限。
         candidate = await extract_online_skill_candidate(
             messages=messages,
             side_query=side_query,
@@ -272,6 +299,7 @@ async def online_ingest(
         return result
 
     if candidate is None:
+        # “没有值得沉淀的经验”是正常终态，也记录 none 供后续统计。
         result = {"ok": True, "action": "none"}
         record_online_provenance(
             action="none",
@@ -282,6 +310,7 @@ async def online_ingest(
         return result
 
     try:
+        # 第二步结合现有集合和相似检索决定 add、merge 或 discard。
         result = await maintain_online_skill_candidate(
             candidate=candidate,
             side_query=side_query,
@@ -292,6 +321,7 @@ async def online_ingest(
     except Exception as exc:
         result = {"ok": False, "action": "failed", "skill": candidate.name, "error": str(exc)}
 
+    # 所有终态统一记录真实消息、身份引用、维护决策和错误，作为 replay 来源。
     record_online_provenance(
         action=str(result.get("action") or "none"),
         skill_name=str(result.get("skill") or candidate.name),
@@ -311,9 +341,11 @@ async def judge_retrieved_skill_usage(
     assistant_text: str,
     side_query: SideQuery | None = None,
 ) -> list[dict[str, Any]]:
+    """逐个判断检索命中是否相关、回答是否实际使用，供 usage gate 累积统计。"""
     if not hits:
         return []
     if side_query is None:
+        # 无 judge 时只能用名称是否出现在回答中的弱启发式，relevant 保守记为 False。
         assistant_lower = assistant_text.lower()
         return [
             {
@@ -336,6 +368,7 @@ async def judge_retrieved_skill_usage(
     )
     payload = {"user_message": user_message, "assistant_reply": assistant_text, "retrieved_skills": hits}
     parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
+    # 按名称与原始 hits 对齐，保证每个 retrieved 候选都产生一条统计记录。
     raw_judgments = parsed.get("judgments") if isinstance(parsed.get("judgments"), list) else []
     by_name = {str(item.get("name") or ""): item for item in raw_judgments if isinstance(item, dict)}
     judgments: list[dict[str, Any]] = []

@@ -1,3 +1,10 @@
+"""面向自动 Skill 演化的在线验收与候选试跑。
+
+评测以真实 provenance 构造 replay，从当前 active Skill 编译程序规则和可选 LLM judge
+规则，再结合 retrieved/relevant/used 信号判定 lineage 状态。失败规则可以产生候选变体，
+但 champion 仅是本地最佳记录，不会覆盖 active SKILL.md。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -175,6 +182,11 @@ def _normalized_messages(value: Any) -> list[dict[str, str]]:
 
 
 def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = False) -> list[dict[str, Any]]:
+    """从当前 Skill 快照编译最多八条固定模板规则。
+
+    规则列表不是由 LLM 自由生成；LLM 仅在启用时执行 ``llm_binary`` 判断。
+    """
+    # 把可观察 Skill 文本拼成统一语料；所有关键词规则只从这里触发。
     corpus = "\n".join(
         [
             str(skill.get("name") or ""),
@@ -185,6 +197,7 @@ def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = Fals
         ]
     )
     low = _normalize_text(corpus)
+    # 基线硬规则始终存在，保证任何 Skill 至少能检查“回答非空”。
     rules: list[dict[str, Any]] = [
         {
             "rule_id": "response_nonempty",
@@ -198,6 +211,7 @@ def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = Fals
 
     skill_requirement = _skill_alignment_requirement(skill)
     if include_llm_rules and skill_requirement:
+        # /skill-eval 有 side_query 时，用完整 Skill 要求补充难以程序化的语义对齐判断。
         rules.append(
             {
                 "rule_id": "skill_instruction_alignment",
@@ -310,6 +324,7 @@ def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = Fals
             }
         )
 
+    # 限制规则数，控制 replay 数量增长后的 judge 调用成本。
     return rules[:8]
 
 
@@ -418,8 +433,10 @@ async def _evaluate_rule_async(
     skill_name: str,
     side_query: SideQuery | None,
 ) -> dict[str, Any]:
+    """执行程序规则或调用 side query 完成一次严格二元 judge。"""
     kind = str(rule.get("kind") or "programmatic").strip()
     if kind == "programmatic":
+        # 确定性规则本地执行，不消耗 side query，也不受模型波动影响。
         return _evaluate_rule(rule, response_text)
 
     if kind != "llm_binary":
@@ -441,6 +458,7 @@ async def _evaluate_rule_async(
             "details": {"error": "missing_requirement_text"},
         }
     if side_query is None:
+        # 理论上同步入口不会编译 LLM 规则；若外部传入则标 skipped，而不是混入普通失败。
         return {
             "rule_id": rule.get("rule_id", ""),
             "label": rule.get("label", ""),
@@ -458,6 +476,7 @@ async def _evaluate_rule_async(
         "Do not write analysis, chain-of-thought, markdown, or any text outside the JSON object.\n"
         "Prefer false if the requirement is not clearly satisfied.\n"
     )
+    # Judge 只看可观察输入输出，不要求验证隐藏工具调用或内部推理过程。
     payload = {
         "requirement": requirement,
         "skill_name": skill_name,
@@ -466,6 +485,7 @@ async def _evaluate_rule_async(
     }
     raw_judge_response = ""
     try:
+        # 调用异常或非 JSON 输出均降级为失败 outcome，但不终止其余 Skill 的整次评测。
         raw_judge_response = await side_query(system, json.dumps(payload, ensure_ascii=False))
         parsed = _parse_json_object(raw_judge_response)
     except Exception as exc:
@@ -491,6 +511,7 @@ async def _evaluate_rule_async(
 
 
 def _active_skill_snapshots() -> dict[str, dict[str, Any]]:
+    """读取当前可加载 Skill，冻结出本轮规则编译需要的文本快照。"""
     try:
         from .skills import discover_skills
     except Exception:
@@ -501,6 +522,7 @@ def _active_skill_snapshots() -> dict[str, dict[str, Any]]:
         name = str(getattr(skill, "name", "") or "").strip()
         if not name:
             continue
+        # 复制纯数据快照，避免评测过程中 Skill 缓存对象变化影响同一次 run。
         snapshots[name] = {
             "name": name,
             "description": str(getattr(skill, "description", "") or ""),
@@ -532,12 +554,15 @@ def _build_replay_pool(
     *,
     freeze: bool = True,
 ) -> list[dict[str, Any]]:
+    """把原始 provenance 与聚合来源整理为去重的真实对话 replay。"""
     samples: dict[str, dict[str, Any]] = {}
 
     def add_sample(source: dict[str, Any], source_kind: str) -> None:
+        # 只保留 user/assistant 文本，工具块和运行时注入不会成为评测证据。
         messages = _normalized_messages(source.get("messages"))
         if not messages or not _latest_message(messages, "user"):
             return
+        # Skill 名称和规范化对话共同生成稳定 id，用于跨 run 去重和固定 split。
         sample_id = _stable_hash(
             {
                 "skill": skill_name,
@@ -557,6 +582,7 @@ def _build_replay_pool(
             "messages": messages,
         }
 
+    # 原始在线日志与聚合索引可能重复包含同一窗口，samples 字典按 id 自动去重。
     for row in rows:
         add_sample(row, "online_log")
     for source in lineage.get("sources", []) if isinstance(lineage.get("sources"), list) else []:
@@ -565,6 +591,7 @@ def _build_replay_pool(
 
     ordered = sorted(samples.values(), key=lambda item: (str(item.get("time") or ""), item["sample_id"]), reverse=True)
     if not freeze:
+        # write_artifacts=False 时只在内存分组，不读取或更新磁盘 frozen pool。
         return _assign_replay_splits(ordered)
     return _freeze_replay_pool(skill_name=skill_name, samples=ordered)
 
@@ -579,8 +606,10 @@ def _split_score(sample_id: str) -> float:
 
 
 def _assign_replay_splits(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按稳定 sample_id 分配 dev/test，并在样本足够时保证两边非空。"""
     out = [dict(item) for item in samples]
     if len(out) < 2:
+        # 单样本不能同时承担开发和晋级测试，因此只能留在 mutate_dev。
         for item in out:
             item["split"] = "mutate_dev"
         return out
@@ -590,6 +619,7 @@ def _assign_replay_splits(samples: list[dict[str, Any]]) -> list[dict[str, Any]]
         item["split"] = "mutate_dev" if score < DEFAULT_DEV_SPLIT_RATIO else "promotion_test"
 
     if not any(item.get("split") == "promotion_test" for item in out):
+        # 哈希分布偶然落在同侧时做保底，确保样本足够后至少有一个晋级测试。
         out[-1]["split"] = "promotion_test"
     if not any(item.get("split") == "mutate_dev" for item in out):
         out[0]["split"] = "mutate_dev"
@@ -597,8 +627,10 @@ def _assign_replay_splits(samples: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def _freeze_replay_pool(*, skill_name: str, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """增量合并磁盘 replay pool，使后续 run 能复用同一批在线证据。"""
     lineage_id = _lineage_id_for_skill(skill_name)
     path = _lineage_dataset_dir(lineage_id) / "replay_pool.jsonl"
+    # 先读旧池再并入本轮新日志，历史证据不会因来源日志边界变化而丢失。
     existing = _read_jsonl(path)
     by_id: dict[str, dict[str, Any]] = {}
 
@@ -613,6 +645,7 @@ def _freeze_replay_pool(*, skill_name: str, samples: list[dict[str, Any]]) -> li
             continue
         previous = by_id.get(sample_id)
         if previous:
+            # 更新来源内容但不信任旧 split；合并完成后统一按稳定 id 重算。
             merged = dict(previous)
             merged.update({key: value for key, value in item.items() if key != "split"})
             by_id[sample_id] = merged
@@ -628,12 +661,14 @@ def _freeze_replay_pool(*, skill_name: str, samples: list[dict[str, Any]]) -> li
 def _summarize_rule_outcomes(rules: list[dict[str, Any]], samples: list[dict[str, Any]]) -> dict[str, Any]:
     outcomes: list[dict[str, Any]] = []
     for sample in samples:
+        # 基线评估直接使用历史 latest_assistant，不重新调用回答模型。
         response = str(sample.get("latest_assistant") or "")
         for rule in rules:
             outcome = _evaluate_rule(rule, response)
             outcome["sample_id"] = sample.get("sample_id", "")
             outcome["split"] = sample.get("split", "")
             outcome["kind"] = rule.get("kind", "programmatic")
+            # hard/soft 通过分别计 2/1 分；失败均为 0，硬失败另有独立计数。
             outcome["score"] = (2.0 if outcome.get("hard") else 1.0) if outcome.get("passed") else 0.0
             outcomes.append(outcome)
 
@@ -647,6 +682,7 @@ async def _summarize_rule_outcomes_async(
     skill_name: str,
     side_query: SideQuery | None,
 ) -> dict[str, Any]:
+    """对每个 replay/规则组合执行判断，并汇总通过率、得分与硬失败。"""
     outcomes: list[dict[str, Any]] = []
     for sample in samples:
         response = str(sample.get("latest_assistant") or "")
@@ -764,9 +800,11 @@ def _build_heuristic_candidate_variants(
     rule_summary: dict[str, Any],
     max_variants: int = 4,
 ) -> list[dict[str, Any]]:
+    """将失败规则转成小范围 guard，构造不直接写回 active Skill 的候选快照。"""
     rule_lookup = _rule_by_id(rules)
     failures = rule_summary.get("failures") if isinstance(rule_summary.get("failures"), list) else []
     if not failures:
+        # 没有显式失败时，只从少量 LLM 规则生成探索候选，避免无边界变体膨胀。
         failures = [{"rule_id": str(rule.get("rule_id") or "")} for rule in rules if str(rule.get("kind") or "") != "programmatic"][:2]
     variants: list[dict[str, Any]] = []
     seen_labels: set[str] = set()
@@ -801,6 +839,7 @@ def _build_heuristic_candidate_variants(
             if requirement:
                 additions.append(f"Requirement to preserve: {requirement[:500]}")
         if reason:
+            # 把本次具体失败原因写成 guard，使候选针对真实 replay 问题而不是泛化重写。
             additions.append(f"Address prior evaluation failure: {reason[:500]}")
         if not additions:
             continue
@@ -836,6 +875,7 @@ async def _build_llm_candidate_variant_async(
     rule_summary: dict[str, Any],
     side_query: SideQuery | None,
 ) -> dict[str, Any] | None:
+    """让 LLM 基于失败证据做一次保持 Skill 身份的小幅候选改写。"""
     if side_query is None:
         return None
     failures = rule_summary.get("failures") if isinstance(rule_summary.get("failures"), list) else []
@@ -885,6 +925,7 @@ async def _generate_variant_response_async(
     sample: dict[str, Any],
     side_query: SideQuery | None,
 ) -> str:
+    """在同一历史对话上注入候选 Skill，重新生成仅用于评测的 assistant 回复。"""
     if side_query is None:
         return ""
     snapshot = variant.get("snapshot") if isinstance(variant.get("snapshot"), dict) else {}
@@ -974,7 +1015,9 @@ async def _build_candidate_eval_bundle_async(
     rule_summary: dict[str, Any],
     side_query: SideQuery | None,
 ) -> dict[str, Any]:
+    """在 mutate_dev 选择最佳候选，并在存在 promotion_test 时单独验证。"""
     if side_query is None or not replay_pool:
+        # 同步模式或无真实样本时无法生成候选回复，因此跳过整个候选链路。
         return {}
     variants = _build_heuristic_candidate_variants(
         lineage_id=lineage_id,
@@ -994,11 +1037,13 @@ async def _build_candidate_eval_bundle_async(
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for variant in variants:
+        # 启发式和 LLM 可能产生相同正文，按 instructions 哈希去重后最多试跑四个。
         key = _stable_hash((variant.get("snapshot") or {}).get("instructions", ""))
         if key in seen:
             continue
         seen.add(key)
         deduped.append(variant)
+    # 候选选择只看 mutate_dev；没有 dev 的异常情况下才回退到全部样本。
     dev_samples = [sample for sample in replay_pool if sample.get("split") == "mutate_dev"] or list(replay_pool)
     test_samples = [sample for sample in replay_pool if sample.get("split") == "promotion_test"]
     outputs: list[dict[str, Any]] = []
@@ -1017,6 +1062,7 @@ async def _build_candidate_eval_bundle_async(
     if not scored:
         return {}
     scored.sort(
+        # 首先最大化平均分；同分时偏好硬失败更少的候选。
         key=lambda item: (
             float(item[1].get("average_score", 0.0) or 0.0),
             -int(item[1].get("hard_failures", 0) or 0),
@@ -1026,6 +1072,7 @@ async def _build_candidate_eval_bundle_async(
     best_variant, best_dev_eval, best_dev_summary = scored[0]
     best_test_summary: dict[str, Any] = {}
     if test_samples:
+        # 只让 dev 最优候选进入 promotion_test，避免用测试集反复挑版本造成泄漏。
         test_outputs, test_outcomes, test_eval = await _evaluate_generated_variant_async(
             variant=best_variant,
             samples=test_samples,
@@ -1062,8 +1109,10 @@ def _skill_status(
     min_relevance_rate: float,
     min_rule_pass_rate: float,
 ) -> tuple[str, list[str]]:
+    """按证据量、规则质量和 usage gate 判定 lineage 的观察状态。"""
     reasons: list[str] = []
     if pruned:
+        # 已归档是终态，优先于所有质量和样本判断。
         return "pruned", ["skill has been archived by usage pruning"]
     if replay_count <= 0 and retrieved <= 0:
         return "unobserved", ["no online replay or usage signal yet"]
@@ -1074,6 +1123,7 @@ def _skill_status(
     if retrieved < min_retrieved:
         reasons.append(f"only {retrieved} retrieval judgment(s)")
     if reasons:
+        # 证据量不足先进入观察期，不让少量偶然通过的样本直接成为 healthy。
         return "incubating", reasons
 
     relevance_rate = _ratio(relevant, retrieved)
@@ -1093,6 +1143,7 @@ def _skill_status(
     if used_rate < min_used_rate:
         reasons.append(f"low used rate {_pct(used_rate)}")
     if reasons:
+        # 证据足够但任一质量/使用门槛失败时进入 watch，等待后续改进或更多信号。
         return "watch", reasons
     return "healthy", ["passes replay rules and usage gates"]
 
@@ -1135,6 +1186,7 @@ def _load_champion(lineage_id: str) -> dict[str, Any]:
 
 
 def _set_champion(lineage_id: str, payload: dict[str, Any]) -> None:
+    # champions.json 提供全局索引；lineage 目录保留独立记录和可阅读的 SKILL.md 快照。
     path = _champions_registry_path()
     registry = _read_json(path, {"version": 1, "champions": {}})
     if not isinstance(registry, dict):
@@ -1174,7 +1226,9 @@ def _promotion_decision(
     champion: dict[str, Any],
     min_score_delta: float = DEFAULT_MIN_SCORE_DELTA,
 ) -> dict[str, Any]:
+    """仅允许 healthy 且得分提升、硬失败不增加的版本更新本地 champion。"""
     if status in {"unobserved", "incubating", "pruned"}:
+        # 缺证据或已归档时，不比较分数，直接禁止晋级。
         return {
             "promoted": False,
             "status": status,
@@ -1184,6 +1238,7 @@ def _promotion_decision(
             "min_score_delta": min_score_delta,
         }
     if status == "watch":
+        # watch 表示证据足够但质量/使用 gate 未过，同样不能成为 champion。
         return {
             "promoted": False,
             "status": "rejected",
@@ -1195,6 +1250,7 @@ def _promotion_decision(
 
     previous_summary = champion.get("summary") if isinstance(champion.get("summary"), dict) else {}
     if not previous_summary:
+        # lineage 第一个 healthy 版本无需比较历史分差，直接建立初始 champion。
         return {
             "promoted": True,
             "status": "active_champion",
@@ -1208,6 +1264,7 @@ def _promotion_decision(
     champion_score = float(previous_summary.get("average_score", 0.0) or 0.0)
     candidate_hard = int(candidate.get("hard_failures", 0) or 0)
     champion_hard = int(previous_summary.get("hard_failures", 0) or 0)
+    # 已有 champion 时既要达到最小增益，也不能通过牺牲硬规则换取软规则得分。
     promoted = bool(
         candidate_score >= champion_score + float(min_score_delta)
         and candidate_hard <= champion_hard
@@ -1237,8 +1294,10 @@ def _persist_eval_artifacts(
     reasons: list[str],
     candidate_bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """保存 eval spec、逐样本输出/判断、run summary 与可选 champion。"""
     lineage_id = _lineage_id_for_skill(skill_name)
     eval_dir = _lineage_eval_dir(lineage_id)
+    # eval_spec 固化本轮规则，便于未来解释某次 judgment 使用了什么标准。
     _write_json(
         eval_dir / "eval_spec.json",
         {
@@ -1251,6 +1310,7 @@ def _persist_eval_artifacts(
 
     run_id = _run_id(lineage_id)
     run_dir = _lineage_run_dir(lineage_id, run_id)
+    # current_active 使用历史真实回复；candidate outputs 随后追加生成式 replay 回复。
     outputs = [
         {
             "sample_id": sample.get("sample_id", ""),
@@ -1265,6 +1325,7 @@ def _persist_eval_artifacts(
     ]
     bundle = candidate_bundle if isinstance(candidate_bundle, dict) else {}
     outputs.extend(list(bundle.get("outputs") or []))
+    # judgments 将每个版本、样本和规则展开为独立行，方便离线审计或重新聚合。
     judgments = [
         {
             "sample_id": outcome.get("sample_id", ""),
@@ -1307,11 +1368,13 @@ def _persist_eval_artifacts(
         rule_summary=rule_summary,
         replay_pool=replay_pool,
     )
+    # 默认拿 current active 参与 champion 判断；候选必须先通过 dev 对比才可替换它。
     promotion_candidate = candidate_summary
     promotion_snapshot = snapshot
     best_variant = bundle.get("best_variant") if isinstance(bundle.get("best_variant"), dict) else {}
     best_dev_summary = bundle.get("best_dev_summary") if isinstance(bundle.get("best_dev_summary"), dict) else {}
     best_test_summary = bundle.get("best_test_summary") if isinstance(bundle.get("best_test_summary"), dict) else {}
+    # dev gate 要求平均分至少提升 0.01，且总硬失败不能增加。
     candidate_beats_current = bool(
         best_dev_summary
         and float(best_dev_summary.get("average_score", 0.0) or 0.0)
@@ -1319,6 +1382,7 @@ def _persist_eval_artifacts(
         and int(best_dev_summary.get("hard_failures", 0) or 0) <= int(candidate_summary.get("hard_failures", 0) or 0)
     )
     if best_variant and best_test_summary and candidate_beats_current:
+        # 候选通过 dev gate 后，晋级时只使用隔离 promotion_test 的结果。
         promotion_candidate = dict(best_test_summary)
         promotion_snapshot = best_variant.get("snapshot") if isinstance(best_variant.get("snapshot"), dict) else snapshot
     champion_before = _load_champion(lineage_id)
@@ -1328,6 +1392,7 @@ def _persist_eval_artifacts(
         champion=champion_before,
     )
     if promotion.get("promoted"):
+        # 这里只写 online-eval/champions，不会覆盖 discover_skills() 加载的 active 文件。
         _set_champion(
             lineage_id,
             {
@@ -1395,6 +1460,8 @@ async def _evaluate_online_skill_evolution_core(
     side_query: SideQuery | None = None,
     include_llm_rules: bool = False,
 ) -> dict[str, Any]:
+    """按 Skill lineage 编排数据读取、replay、规则、候选、状态和报告。"""
+    # 一次性读取四类在线证据和当前 active 快照，后续按 Skill 名称汇合为 lineage。
     root = get_evolution_dir()
     provenance_rows = _read_jsonl(root / ONLINE_PROVENANCE_LOG)
     provenance_index = _read_json(root / ONLINE_PROVENANCE_INDEX, {})
@@ -1408,6 +1475,7 @@ async def _evaluate_online_skill_evolution_core(
     candidate_events = 0
     accepted_events = 0
     recent_failures: list[dict[str, Any]] = []
+    # 先统计在线沉淀链路自身是否健康：有多少候选、接受、拒绝和失败事件。
     for row in provenance_rows:
         action = str(row.get("action") or "none")
         bucket = _action_bucket(action)
@@ -1428,6 +1496,7 @@ async def _evaluate_online_skill_evolution_core(
                 }
             )
 
+    # 取各数据源 Skill 名称并集：即使 active 文件消失或完全没有 replay，也保留报告项。
     all_names = set(active_skills)
     if isinstance(provenance_index, dict):
         all_names.update(str(name) for name in provenance_index if str(name).strip())
@@ -1437,6 +1506,7 @@ async def _evaluate_online_skill_evolution_core(
 
     skills: list[dict[str, Any]] = []
     for name in sorted(all_names):
+        # 同一名称下合并 provenance、usage、lifecycle 和 active 文件四个视角。
         lineage_raw = provenance_index.get(name, {}) if isinstance(provenance_index, dict) else {}
         usage_raw = usage_stats.get(name, {}) if isinstance(usage_stats, dict) else {}
         lifecycle_raw = lifecycle_stats.get(name, {}) if isinstance(lifecycle_stats, dict) else {}
@@ -1445,6 +1515,7 @@ async def _evaluate_online_skill_evolution_core(
         lifecycle = lifecycle_raw if isinstance(lifecycle_raw, dict) else {}
         snapshot = active_skills.get(name, {})
         if not snapshot:
+            # active SKILL.md 不存在时构造降级快照，使 lineage 不会从报告中消失。
             snapshot = {
                 "name": name,
                 "description": str(lineage.get("description") or lifecycle.get("description") or ""),
@@ -1452,8 +1523,10 @@ async def _evaluate_online_skill_evolution_core(
                 "instructions": "",
             }
 
+        # provenance 负责提供真实 replay，active snapshot 负责提供当前评测规则。
         replay_pool = _build_replay_pool(name, grouped_rows.get(name, []), lineage, freeze=write_artifacts)
         rules = _compile_eval_rules(snapshot, include_llm_rules=include_llm_rules)
+        # 每条 replay 的历史 assistant 回复都要执行全部已编译规则。
         rule_summary = await _summarize_rule_outcomes_async(
             rules,
             replay_pool,
@@ -1461,12 +1534,14 @@ async def _evaluate_online_skill_evolution_core(
             side_query=side_query,
         )
         public_rule_summary = dict(rule_summary)
+        # 完整 outcomes 只写 run artifact，顶层报告保留摘要以控制文件体积。
         public_rule_summary.pop("outcomes", None)
         retrieved = int(usage.get("retrieved", lifecycle.get("retrieved", 0)) or 0)
         relevant = int(usage.get("relevant", lifecycle.get("relevant", 0)) or 0)
         used = int(usage.get("used", lifecycle.get("used", 0)) or 0)
         pruned = bool(usage.get("pruned") or lifecycle.get("pruned"))
         promotion_test_count = sum(1 for item in replay_pool if item.get("split") == "promotion_test")
+        # 状态门控同时要求证据量、规则通过率、相关率、使用率和零硬失败。
         status, reasons = _skill_status(
             replay_count=len(replay_pool),
             promotion_test_count=promotion_test_count,
@@ -1486,6 +1561,7 @@ async def _evaluate_online_skill_evolution_core(
             lineage.get("current_version", lifecycle.get("version", ""))
         )
         snapshot["version"] = str(current_version or "")
+        # 有 side_query 和 replay 时，针对失败规则生成变体并重放相同历史任务。
         candidate_bundle = await _build_candidate_eval_bundle_async(
             lineage_id=_lineage_id_for_skill(name),
             snapshot=snapshot,
@@ -1494,6 +1570,7 @@ async def _evaluate_online_skill_evolution_core(
             rule_summary=rule_summary,
             side_query=side_query,
         )
+        # write_artifacts=False 是纯读取模式：不固化 replay、run 或 champion。
         artifacts = (
             _persist_eval_artifacts(
                 skill_name=name,
@@ -1556,6 +1633,7 @@ async def _evaluate_online_skill_evolution_core(
     total_llm_rule_outcomes = 0
     total_llm_rule_passed = 0
     total_candidate_variants = 0
+    # 单 Skill 结果完成后再汇总全局状态、规则、LLM judge 和候选数量。
     for item in skills:
         status = str(item.get("status") or "unknown")
         status_counts[status] = int(status_counts.get(status, 0)) + 1
@@ -1575,6 +1653,7 @@ async def _evaluate_online_skill_evolution_core(
         candidate_eval = item.get("candidate_eval") if isinstance(item.get("candidate_eval"), dict) else {}
         total_candidate_variants += int(candidate_eval.get("candidate_count", 0) or 0)
 
+    # 顶层 report 同时服务 JSON 审计和 format_online_skill_eval 的终端摘要。
     report = {
         "generated_at": _utc_now(),
         "mode": "online_skill_lineage_eval",
@@ -1622,6 +1701,7 @@ async def _evaluate_online_skill_evolution_core(
         "recent_failures": recent_failures[-10:],
     }
     if write_report:
+        # report 与按 lineage 划分的 run artifacts 分开保存，便于快速查看全局状态。
         report_path = root / "online_eval_report.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1640,6 +1720,7 @@ def evaluate_online_skill_evolution(
     write_report: bool = True,
     write_artifacts: bool = True,
 ) -> dict[str, Any]:
+    """无 side query 的同步快捷入口，只执行程序化规则和基线评测。"""
     import asyncio
 
     return asyncio.run(
@@ -1670,6 +1751,7 @@ async def evaluate_online_skill_evolution_async(
     write_report: bool = True,
     write_artifacts: bool = True,
 ) -> dict[str, Any]:
+    """异步完整入口；传入 side query 时启用 LLM judge 与候选回复试跑。"""
     return await _evaluate_online_skill_evolution_core(
         min_replay_samples=min_replay_samples,
         min_promotion_tests=min_promotion_tests,
@@ -1707,6 +1789,7 @@ def _format_eval_failure_summary(eval_data: dict[str, Any], *, limit: int = 2) -
 
 
 def format_online_skill_eval(report: dict[str, Any] | None = None) -> str:
+    """将完整 JSON 报告压缩为按风险排序的 REPL 摘要。"""
     report = report or evaluate_online_skill_evolution()
     aggregate = report.get("aggregate") if isinstance(report.get("aggregate"), dict) else {}
     actions = aggregate.get("actions") if isinstance(aggregate.get("actions"), dict) else {}
@@ -1813,6 +1896,7 @@ async def format_online_skill_eval_async(
     side_query: SideQuery | None = None,
     report: dict[str, Any] | None = None,
 ) -> str:
+    """运行异步在线评测并直接返回终端摘要。"""
     if report is None:
         report = await evaluate_online_skill_evolution_async(side_query=side_query)
     return format_online_skill_eval(report)

@@ -1,4 +1,8 @@
-"""Terminal UI rendering — colored output, spinner, tool display."""
+"""终端展示层：统一渲染文本、工具调用/结果、确认、计划、Memory 与 Skills。
+
+本模块不参与 Agent 决策；Runtime 只传入结构化或文本结果，UI 再负责安全编码、颜色、
+摘要和 spinner 生命周期。
+"""
 
 from __future__ import annotations
 
@@ -82,6 +86,7 @@ def print_assistant_text(text: str) -> None:
 
 
 def print_tool_call(name: str, inp: dict) -> None:
+    """显示工具名和紧凑入参摘要，避免把大段内容重复打印到终端。"""
     icon = _get_tool_icon(name)
     summary = _get_tool_summary(name, inp)
     table = Table.grid(padding=(0, 1))
@@ -100,6 +105,7 @@ def print_tool_call(name: str, inp: dict) -> None:
 
 
 def print_tool_result(name: str, result: str) -> None:
+    """按文件变更或普通结果选择展示方式，并限制终端噪声。"""
     result = _safe_text(result)
     if (name in ("edit_file", "write_file")) and not result.startswith("Error"):
         _print_file_change_result(name, result)
@@ -229,6 +235,7 @@ _spinner_stop = threading.Event()
 
 
 def start_spinner(label: str = "Thinking") -> None:
+    """启动单例后台 spinner；模型开始流式输出后由 stop_spinner 关闭。"""
     global _spinner_thread
     if _spinner_thread is not None:
         return
@@ -247,6 +254,7 @@ def start_spinner(label: str = "Thinking") -> None:
 
 
 def stop_spinner() -> None:
+    """停止并回收 spinner 线程；未启动时可安全重复调用。"""
     global _spinner_thread
     if _spinner_thread is None:
         return
@@ -260,6 +268,7 @@ def stop_spinner() -> None:
 
 
 def print_plan_for_approval(plan_content: str) -> None:
+    """展示计划文件内容，具体审批选择由 REPL 回调收集。"""
     lines = plan_content.split("\n")
     max_lines = 60
     preview = "\n".join(lines[:max_lines])

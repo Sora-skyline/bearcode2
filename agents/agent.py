@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""Bear Code 的 Agentic Harness Runtime。
+
+本模块把模型调用、双协议消息历史、工具路由、权限、预算、上下文压缩、Memory、
+Skills、MCP 和子 Agent 串成持续循环。Agent.chat 是单轮总入口，真正的模型循环
+位于 _chat_anthropic 与 _chat_openai；所有工具最终先经过 _execute_tool_call 分流。
+
+BearCode2 在基础压缩流水线之外增加了结构化 Session Memory folding：既可在上下文
+达到阈值时自动触发，也允许模型通过 compact_context 工具主动触发。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -132,6 +142,12 @@ def _to_openai_tools(tools: list[ToolDef]) -> list[dict]:
 
 
 class Agent:
+    """同时支撑主 Agent 与隔离子 Agent 的有状态运行时。
+
+    is_sub_agent、自定义 system prompt 和工具集合共同决定能力边界。实例同时维护
+    Anthropic 与 OpenAI 两套协议消息容器，但一次运行只会使用其中一套。
+    """
+
     def __init__(self,
                  *,
                  permission_mode:str="default",
@@ -207,6 +223,7 @@ class Agent:
         self._last_retrieved_skill_hits: list[dict[str, Any]] = []
         self._pending_skill_extraction_window: dict[str, Any] | None = None
         self._background_skill_tasks: set[asyncio.Task] = set()
+        # 每次上下文折叠都保留结构化记录，并维护用于提示模型的运行期触发信号。
         self._folded_session_memories: list[dict[str, Any]] = []
         self._fold_last_time: float = 0.0
         self._fold_count: int = 0
@@ -397,6 +414,11 @@ class Agent:
     #主入口
 
     async def  chat(self, user_message:str)->None:
+        """执行一轮完整对话，并在主回复后调度 Skill 反馈与演化任务。
+
+        original_user_message 始终保留纯用户输入；实际发给模型的 user_message 可能
+        追加检索到的 Skill 上下文。MCP 在主 Agent 的第一次对话中懒加载。
+        """
         #懒加载MCP服务在第一次chat的时候
         if not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
@@ -474,6 +496,7 @@ class Agent:
             print_assistant_text(text)
 
     def _build_fold_guidance_section(self) -> str:
+        """把上下文占用、工具失败和重复调用信号追加到动态 system prompt。"""
         if self._custom_system_prompt is not None:
             return ""
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0.0
@@ -489,6 +512,7 @@ class Agent:
         )
 
     def _refresh_runtime_system_prompt(self) -> None:
+        """重新扫描动态能力，并同步当前 Plan/Fold 状态到 system prompt。"""
         if self._custom_system_prompt is not None:
             return
         self._base_system_prompt = build_system_prompt()
@@ -501,6 +525,7 @@ class Agent:
             self._openai_messages[0]["content"] = self._system_prompt
 
     def _record_tool_outcome(self, tool_name: str, success: bool) -> None:
+        """累计连续失败与同名工具重复次数，供模型判断是否应主动折叠。"""
         if tool_name == self._last_tool_name:
             self._same_tool_repeat_count += 1
         else:
@@ -512,6 +537,7 @@ class Agent:
             self._tool_error_streak += 1
 
     def _record_fold_event(self) -> None:
+        """记录折叠时间并清空已经被折叠吸收的工具异常信号。"""
         self._fold_last_time = time.time()
         self._fold_count += 1
         self._tool_error_streak = 0
@@ -519,6 +545,7 @@ class Agent:
         self._last_tool_name = ""
 
     def _looks_like_tool_failure(self, tool_name: str, raw: str, result: str) -> bool:
+        """从统一工具文本中做保守的失败标记；结果仅用于提示，不决定执行成败。"""
         text = f"{raw}\n{result}".lower()
         if any(marker in text for marker in ("error", "denied", "timed out", "timeout")):
             return True
@@ -527,6 +554,7 @@ class Agent:
         return False
 
     def _augment_user_message_with_skill_context(self, user_message: str) -> tuple[str, dict[str, Any] | None]:
+        """检索最多三个相关 Skill，将摘要注入输入并保留命中证据。"""
         try:
             from .skills import format_retrieved_skill_context
 
@@ -616,6 +644,7 @@ class Agent:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def _pop_pending_skill_extraction_window(self, next_user_feedback: str) -> dict[str, Any] | None:
+        """用下一轮反馈补全上一轮对话窗口，再交给在线 Skill 抽取器。"""
         pending = self._pending_skill_extraction_window
         self._pending_skill_extraction_window = None
         if not pending:
@@ -754,6 +783,7 @@ class Agent:
 
     #压缩会话
     async def compact(self)->None:
+        """处理 REPL 的手动压缩请求；历史不足时只提示而不改写消息。"""
         compacted = await self._compact_conversation(trigger="manual")
         if not compacted:
             print_info("Nothing to compact yet.")
@@ -845,11 +875,13 @@ class Agent:
 
     #自动压缩
     async def _check_and_compact(self)->None:
+        """输入 token 超过有效窗口阈值后触发自动结构化折叠。"""
         if self.last_input_token_count > self.effective_window * AUTO_COMPACT_THRESHOLD:
             print_info("Context window filling up, compacting conversation...")
             await self._compact_conversation(trigger="auto")
 
     async def _compact_conversation(self, *, trigger: str = "manual")->bool:
+        """按当前协议折叠上下文，并返回本次是否真的发生压缩。"""
         if self.use_openai:
             compacted = await self._compact_openai(trigger=trigger)
         else:
@@ -859,6 +891,7 @@ class Agent:
         return compacted
 
     async def _compact_anthropic(self, *, trigger: str)->bool:
+        """将 Anthropic 原始历史替换为一条结构化 Session Memory 用户消息。"""
         if len (self._anthropic_messages)<4:
             return False
 
@@ -874,6 +907,7 @@ class Agent:
         return True
 
     async def _compact_openai(self, *, trigger: str)->bool:
+        """保留 OpenAI system 消息，其余历史折叠为结构化用户消息。"""
         if len (self._openai_messages)<4:
             return False
         system_msg = self._openai_messages[0]
@@ -892,6 +926,7 @@ class Agent:
         return True
 
     async def _generate_folded_session_memory(self, transcript: str) -> dict[str, Any]:
+        """调用同模型 side query 生成折叠 JSON，失败时退回截断转录。"""
         side_query = self._build_side_query(max_tokens=6000)
         if side_query is None:
             return fallback_folded_memory(transcript)
@@ -902,6 +937,7 @@ class Agent:
             return fallback_folded_memory(transcript)
 
     def _record_folded_session_memory(self, trigger: str, memory: dict[str, Any]) -> None:
+        """同时把折叠记录保存到内存会话状态和项目级审计文件。"""
         record = {
             "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "trigger": trigger,
@@ -1092,6 +1128,7 @@ class Agent:
     #执行工具入口
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
+        """统一分发折叠、Plan、子 Agent、Skill、MCP 与普通内置工具。"""
         if name == "compact_context":
             return await self._execute_compact_context_tool(inp)
         if name in ("enter_plan_mode", "exit_plan_mode"):
@@ -1114,6 +1151,7 @@ class Agent:
         return result
 
     async def _execute_compact_context_tool(self, inp: dict) -> str:
+        """执行模型主动折叠，并通知当前工具循环停止使用已经被替换的历史。"""
         reason = str(inp.get("reason") or "").strip()
         compacted = await self._compact_conversation(trigger="tool")
         if not compacted:
@@ -1286,6 +1324,7 @@ class Agent:
 
 #--------------Anthropic 后端---------------
     async def  _chat_anthropic(self, user_message: str) -> None:
+        """运行 Anthropic tool_use/tool_result 协议循环，并提前执行并发安全工具。"""
         self._anthropic_messages = self._normalize_anthropic_messages(_sanitize_for_utf8(self._anthropic_messages))
         user_message = _safe_utf8_text(user_message)
         # 先把本轮用户输入放入 Anthropic 消息历史，后续每轮模型调用都会带上这段上下文。
@@ -1579,6 +1618,7 @@ class Agent:
     #openAI后端
 
     async def _chat_openai(self, user_message:str) -> None:
+        """运行 OpenAI tool_calls/role=tool 协议循环，并批量执行只读工具。"""
         user_message = _safe_utf8_text(user_message)
         self._openai_messages.append({"role": "user", "content": user_message})
 
