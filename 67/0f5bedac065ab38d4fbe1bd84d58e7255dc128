@@ -1,0 +1,39 @@
+paper/cmp.md
+  h_980cd48a740375 1-87
+agents/agent.py
+  s_4a6a947b85e094::t_c096cbbf0ed20b 30-31,38,40,140-166,216-218,230-241,246-250,257-258,266,315,318-320,409-411,413,419,424-431,434,444-445,449,451,461-468,472,484-485,538-556,571,582,584-586,588-589,592-598,606,614,621,631-635,650-651,659-663,680,698,746,802-803,895,955-957,966-967,971-973,1060-1061,1081-1082,1089-1097,1103-1119,1178-1179,1363-1375,1382-1392,1407-1415,1445-1446,1476-1477,1595-1596,1696-1697,1701-1704,1724,1853-1854,1997-1998,2005-2006,2020,2137-2138,2140-2147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "3.2.115",
+  "base_commit_sha": "670f5bedac065ab38d4fbe1bd84d58e7255dc128",
+  "prompts": {
+    "s_4a6a947b85e094": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ff0ae-d993-7540-8cce-e1586a6b6be7",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "sora_skyline <zhouyuan90@huawei.com>",
+      "total_additions": 246,
+      "total_deletions": 24,
+      "accepted_lines": 244,
+      "overriden_lines": 2
+    }
+  },
+  "humans": {
+    "h_980cd48a740375": {
+      "author": "sora_skyline <zhouyuan90@huawei.com>"
+    }
+  },
+  "sessions": {
+    "s_4a6a947b85e094": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ff0ae-d993-7540-8cce-e1586a6b6be7",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "sora_skyline <zhouyuan90@huawei.com>"
+    }
+  }
+}
