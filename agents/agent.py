@@ -27,14 +27,17 @@ BearCode2 在基础压缩流水线之外增加了结构化 Session Memory foldin
 from __future__ import annotations
 
 import asyncio
+import copy
+import inspect
 import json
 import logging
 import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Awaitable, Any
+from typing import Callable, Awaitable, Any, Literal
 
 import anthropic
 import openai
@@ -134,6 +137,33 @@ MICROCOMPACT_IDLE_S = 5 * 60  # 5 minutes
 
 KEEP_RECENT_RESULTS = 3
 
+SKILL_TOOL_NAMES = {"skill", "skill_create", "skill_evolve"}
+SKILL_MUTATION_TOOL_NAMES = {"skill_create", "skill_evolve"}
+FOLD_TOOL_NAMES = {"compact_context"}
+
+
+@dataclass(frozen=True)
+class RuntimeFeatures:
+    """Independent Agent runtime switches. Defaults preserve current behavior."""
+
+    skill_mode: Literal["off", "static", "evolve"] = "evolve"
+    folding_mode: Literal["off", "structured"] = "structured"
+    effective_window_override: int | None = None
+    max_folds: int | None = None
+    mcp_enabled: bool = True
+    auto_save: bool = True
+    temperature: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.skill_mode not in {"off", "static", "evolve"}:
+            raise ValueError(f"unsupported skill_mode: {self.skill_mode}")
+        if self.folding_mode not in {"off", "structured"}:
+            raise ValueError(f"unsupported folding_mode: {self.folding_mode}")
+        if self.effective_window_override is not None and self.effective_window_override <= 0:
+            raise ValueError("effective_window_override must be positive")
+        if self.max_folds is not None and self.max_folds < 0:
+            raise ValueError("max_folds must be non-negative")
+
 
 
 def _get_max_output_tokens(model: str) -> int:
@@ -183,7 +213,9 @@ class Agent:
                  confirm_fn:Callable[[str], Awaitable[bool]] | None=None,
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
-                 is_sub_agent: bool=False,):
+                 is_sub_agent: bool=False,
+                 runtime_features: RuntimeFeatures | None=None,
+                 custom_tool_executor: Callable[[str, dict[str, Any]], Awaitable[str] | str] | None=None,):
         """创建一份会话级 Runtime 状态，并按 API 协议初始化对应客户端。
 
         ``custom_system_prompt`` 和 ``custom_tools`` 主要供子 Agent/Skill fork 使用；
@@ -195,18 +227,35 @@ class Agent:
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
-        self.tools = custom_tools or tool_definitions
+        self.runtime_features = runtime_features or RuntimeFeatures()
+        self.tools = list(tool_definitions if custom_tools is None else custom_tools)
+        if self.runtime_features.skill_mode == "off":
+            self.tools = [tool for tool in self.tools if tool.get("name") not in SKILL_TOOL_NAMES]
+        elif self.runtime_features.skill_mode == "static":
+            self.tools = [tool for tool in self.tools if tool.get("name") not in SKILL_MUTATION_TOOL_NAMES]
+        if self.runtime_features.folding_mode == "off":
+            self.tools = [tool for tool in self.tools if tool.get("name") not in FOLD_TOOL_NAMES]
+        self._custom_tool_executor = custom_tool_executor
+        self._custom_tool_names = {
+            tool.get("name") for tool in (custom_tools or []) if tool.get("name")
+        }
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
         self._custom_system_prompt = custom_system_prompt
-        self.effective_window=_get_context_windows(model) -20000
+        self.effective_window = (
+            self.runtime_features.effective_window_override
+            if self.runtime_features.effective_window_override is not None
+            else _get_context_windows(model) - 20000
+        )
         self.session_id = uuid.uuid4().hex[:8]
         self.session_start_time= time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
 
         # ── 计量状态：每次模型响应后累计，用于 /cost 和预算熔断 ──
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self.side_input_tokens = 0
+        self.side_output_tokens = 0
         self.last_input_token_count = 0
         self.current_turns = 0
         self.last_api_call_time = 0
@@ -214,6 +263,7 @@ class Agent:
 
         # ── 控制状态：中止、交互确认和“编辑前必须读取”都只在当前会话生效 ──
         self._aborted = False
+        self._stop_reason = "idle"
         #存储异步任务
         self._current_task:asyncio.Task | None = None
         #权限白名单
@@ -262,9 +312,12 @@ class Agent:
         self._tool_error_streak: int = 0
         self._same_tool_repeat_count: int = 0
         self._last_tool_name: str = ""
+        self._trace: list[dict[str, Any]] = []
 
         # system prompt 是当前能力快照；Plan/Fold 提示在基础 prompt 之上动态拼接。
-        self._base_system_prompt = custom_system_prompt or build_system_prompt()
+        self._base_system_prompt = custom_system_prompt or build_system_prompt(
+            include_skills=self.runtime_features.skill_mode != "off"
+        )
 
         if self.permission_mode == "plan":
             self._plan_file_path = self._generate_plan_file_path()
@@ -353,18 +406,32 @@ class Agent:
 
         side query 使用相同客户端和模型，但只携带专用 system/user prompt；因此召回、
         折叠和评审结果不会把辅助对话写进主 Agent Loop。
+
+        根据当前已初始化的客户端返回对应的异步调用函数；若没有可用客户端则返回
+        ``None``。返回函数统一接收 system prompt 和 user message，并返回纯文本结果。
         """
+        # 优先复用 Anthropic 兼容客户端，避免为辅助查询重复创建连接或维护额外配置。
         if self._anthropic_client:
             client = self._anthropic_client
             model = self.model
             async def _sq(system:str, user_message:str)->str:
 
+                # 每次调用仅发送本次辅助查询的 system/user 内容，不读取或写入主对话历史。
                 resp = await client.messages.create(
                     model=model, max_tokens=max(1, int(max_tokens)), system=system,
                 messages=[{"role": "user", "content": user_message}],
                 )
+                usage = getattr(resp, "usage", None)
+                input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+                output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+                self.side_input_tokens += input_tokens
+                self.side_output_tokens += output_tokens
+                self._trace_event("side_query", protocol="anthropic", input_tokens=input_tokens,
+                                  output_tokens=output_tokens)
+                # Anthropic 响应可能包含多种内容块，只拼接其中的文本块作为统一返回值。
                 text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
                 if not text.strip():
+                    # 空文本仍原样返回，同时记录响应元信息，便于定位模型或接口兼容问题。
                     block_types = [str(getattr(b, "type", "")) for b in getattr(resp, "content", [])]
                     logging.warning(
                         "side_query returned empty Anthropic-compatible response: model=%s stop_reason=%s content_block_types=%s",
@@ -374,10 +441,14 @@ class Agent:
                     )
                 return text
             return _sq
+
+        # 未配置 Anthropic 客户端时，回退到 OpenAI Chat Completions 兼容客户端。
         if self._openai_client:
             client = self._openai_client
             model = self.model
+
             async def _sq_openai(system:str, user_message:str)->str:
+                # 与 Anthropic 分支保持相同输入语义：仅发送独立的 system/user 消息。
                 resp = await client.chat.completions.create(
                     model=model,
                     max_tokens=max(1, int(max_tokens)),
@@ -387,9 +458,18 @@ class Agent:
                     ],
 
                 )
+                usage = getattr(resp, "usage", None)
+                input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+                output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+                self.side_input_tokens += input_tokens
+                self.side_output_tokens += output_tokens
+                self._trace_event("side_query", protocol="openai", input_tokens=input_tokens,
+                                  output_tokens=output_tokens)
+                # 兼容服务可能返回空 choices；此时记录告警并以空字符串作为安全结果。
                 if not resp.choices:
                     logging.warning("side_query returned no OpenAI-compatible choices: model=%s", model)
                     return ""
+                # side query 只消费第一候选，并把 None 内容归一化为空字符串。
                 choice = resp.choices[0]
                 content = choice.message.content or ""
                 if not content.strip():
@@ -401,6 +481,8 @@ class Agent:
                     )
                 return content
             return _sq_openai
+
+        # 两类客户端都未初始化时，调用方可通过 None 判断 side query 不可用。
         return None
     #异步任务取消（Abort）
     def abort(self) -> None:
@@ -453,7 +535,25 @@ class Agent:
 
     def get_token_usage(self) -> dict:
         """返回包含子 Agent 消耗在内的会话累计 token。"""
-        return {"input":self.total_input_tokens, "output":self.total_output_tokens}
+        return {
+            "input": self.total_input_tokens,
+            "output": self.total_output_tokens,
+            "side_input": self.side_input_tokens,
+            "side_output": self.side_output_tokens,
+            "total_input": self.total_input_tokens + self.side_input_tokens,
+            "total_output": self.total_output_tokens + self.side_output_tokens,
+        }
+
+    def _trace_event(self, event: str, **payload: Any) -> None:
+        self._trace.append({
+            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": event,
+            **_sanitize_for_utf8(payload),
+        })
+
+    def get_trace(self) -> list[dict[str, Any]]:
+        """Return a defensive copy of the append-only evaluation trace."""
+        return copy.deepcopy(self._trace)
 
     #主入口
 
@@ -468,7 +568,7 @@ class Agent:
         请求”，而是直到模型给出最终文本为止的一整轮 Agent 任务。
         """
         # 阶段 1：首次对话发现 MCP 工具；子 Agent 不再重复创建 MCP 子进程。
-        if not self._mcp_initialized and not self.is_sub_agent:
+        if self.runtime_features.mcp_enabled and not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
             try:
                 await self._mcp_manager.load_and_connect()
@@ -479,12 +579,23 @@ class Agent:
                 print_error(f"MCP init failed: {e}")
 
         # 阶段 2：保留纯用户输入用于审计，同时给实际模型输入追加相关 Skill 摘要。
+        # 先清洗非法 UTF-8 字符，确保 trace、Skill 统计等后续流程拿到稳定的原始文本。
         original_user_message = _safe_utf8_text(user_message)
+        self._trace_event("chat_start", user_message=original_user_message)
+
+        # evolve 模式会在本轮消费上一轮暂存的对话窗口，用于异步提炼新 Skill。
         ready_skill_extraction_window: dict[str, Any] | None = None
+
+        # 检索结果属于单轮状态，必须在每次 chat 开始时重置，避免沿用上一轮的 Skill。
         self._last_retrieved_skill_reference = None
         self._last_retrieved_skill_hits = []
-        if not self.is_sub_agent:
-            ready_skill_extraction_window = self._pop_pending_skill_extraction_window(original_user_message)
+
+        # Skill 检索只由主 Agent 执行；子 Agent 直接使用调用方提供的上下文。
+        if not self.is_sub_agent and self.runtime_features.skill_mode != "off":
+            if self.runtime_features.skill_mode == "evolve":
+                ready_skill_extraction_window = self._pop_pending_skill_extraction_window(original_user_message)
+
+            # 保留 original_user_message 不变，仅增强实际发送给模型的 user_message。
             user_message, self._last_retrieved_skill_reference = self._augment_user_message_with_skill_context(
                 original_user_message
             )
@@ -492,6 +603,7 @@ class Agent:
         # 阶段 3：选择协议循环。两条循环语义相同，但消息/tool result 格式不同。
         # create_task 让 abort() 可以持有并取消整条 Agent 执行链，而不只是停止终端输出。
         self._aborted = False
+        self._stop_reason = "running"
         self._turn_output_buffer = []
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.create_task(coro)
@@ -499,13 +611,14 @@ class Agent:
             await self._current_task
         except asyncio.CancelledError:
             self._aborted = True
+            self._stop_reason = "aborted"
 
         finally:
             self._current_task = None
         # 阶段 4：主回复完成后再做统计与在线演化，避免辅助模型请求增加响应延迟。
         assistant_text = "".join(self._turn_output_buffer or []).strip()
         self._turn_output_buffer = None
-        if not self.is_sub_agent and not self._aborted:
+        if not self.is_sub_agent and not self._aborted and self.runtime_features.skill_mode == "evolve":
             self._schedule_background_skill_task(self._run_skill_usage_tracking(original_user_message, assistant_text))
             if ready_skill_extraction_window:
                 self._schedule_background_skill_task(self._run_online_skill_evolution(ready_skill_extraction_window))
@@ -515,6 +628,11 @@ class Agent:
                 retrieved_reference=self._last_retrieved_skill_reference,
             )
         if not self.is_sub_agent:
+            self._trace_event("chat_end", assistant_text=assistant_text,
+                              stop_reason=(
+                                  self._stop_reason
+                                  if self._stop_reason != "running" else "completed"
+                              ))
             print_divider()
             self._auto_save()
 
@@ -529,6 +647,8 @@ class Agent:
         self._output_buffer = []
         prev_in = self.total_input_tokens
         prev_out = self.total_output_tokens
+        prev_side_in = self.side_input_tokens
+        prev_side_out = self.side_output_tokens
         await self.chat(prompt)
         text = "".join(self._output_buffer)
         self._output_buffer = None
@@ -536,7 +656,11 @@ class Agent:
             "text": text,
             "tokens":{
                 "input":self.total_input_tokens-prev_in,
-                "output":self.total_output_tokens-prev_out
+                "output":self.total_output_tokens-prev_out,
+                "side_input": self.side_input_tokens - prev_side_in,
+                "side_output": self.side_output_tokens - prev_side_out,
+                "total_input": (self.total_input_tokens - prev_in) + (self.side_input_tokens - prev_side_in),
+                "total_output": (self.total_output_tokens - prev_out) + (self.side_output_tokens - prev_side_out),
             },
         }
 
@@ -553,7 +677,7 @@ class Agent:
 
     def _build_fold_guidance_section(self) -> str:
         """把上下文占用、工具失败和重复调用信号追加到动态 system prompt。"""
-        if self._custom_system_prompt is not None:
+        if self._custom_system_prompt is not None or self.runtime_features.folding_mode == "off":
             return ""
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0.0
         last_fold = "never" if not self._fold_last_time else f"{int((time.time() - self._fold_last_time) / 60)}m ago"
@@ -571,7 +695,7 @@ class Agent:
         """重新扫描动态能力，并同步当前 Plan/Fold 状态到 system prompt。"""
         if self._custom_system_prompt is not None:
             return
-        self._base_system_prompt = build_system_prompt()
+        self._base_system_prompt = build_system_prompt(include_skills=self.runtime_features.skill_mode != "off")
         if self.permission_mode == "plan":
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
         else:
@@ -619,6 +743,7 @@ class Agent:
             return user_message, None
         if top_ref and isinstance(top_ref.get("all_hits"), list):
             self._last_retrieved_skill_hits = list(top_ref.get("all_hits") or [])
+        self._trace_event("skill_retrieval", hits=self._last_retrieved_skill_hits)
         if not context.strip():
             return user_message, top_ref
         return f"{user_message}\n\n{context}", top_ref
@@ -674,6 +799,8 @@ class Agent:
         return self.permission_mode in {"bypassPermissions", "acceptEdits"}
 
     def _online_evolution_enabled(self) -> bool:
+        if self.runtime_features.skill_mode != "evolve":
+            return False
         raw = os.environ.get("BEAR_AUTO_SKILL_EVOLUTION", "1").strip().lower()
         return raw not in {"0", "false", "no", "off"}
 
@@ -765,6 +892,7 @@ class Agent:
             confirm_write=self._confirm_online_skill_write if interactive_confirm else self._confirm_background_online_skill_write,
             target=os.environ.get("BEAR_AUTO_SKILL_TARGET", "project"),
         )
+        self._trace_event("skill_evolution", result=result)
         if result.get("ok"):
             if result.get("action") in {"add", "merge"}:
                 self._refresh_runtime_system_prompt()
@@ -824,6 +952,9 @@ class Agent:
             self._openai_messages.append({"role": "system", "content":self._system_prompt})
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self.side_input_tokens = 0
+        self.side_output_tokens = 0
+        self._trace = []
         self.last_input_token_count = 0
         print_info("Conversation cleared.")
 
@@ -832,11 +963,14 @@ class Agent:
         budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd else ""
         turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
         print_info(
-            f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
+            f"Tokens: {self.total_input_tokens} main in / {self.total_output_tokens} main out; "
+            f"{self.side_input_tokens} side in / {self.side_output_tokens} side out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
 
     #获取当前的花费，
     def _get_current_cost_usd(self) -> float:
-        return (self.total_input_tokens / 1_000_000) * 3 + (self.total_output_tokens / 1_000_000) * 15
+        input_tokens = self.total_input_tokens + self.side_input_tokens
+        output_tokens = self.total_output_tokens + self.side_output_tokens
+        return (input_tokens / 1_000_000) * 3 + (output_tokens / 1_000_000) * 15
 
     #检查预算
     def _check_budget(self) -> dict:
@@ -923,6 +1057,8 @@ class Agent:
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
 
     def _auto_save(self) -> None:
+        if not self.runtime_features.auto_save:
+            return
         try:
             save_session(self.session_id, {
                 "metadata": {
@@ -942,17 +1078,45 @@ class Agent:
     #自动压缩
     async def _check_and_compact(self)->None:
         """输入 token 超过有效窗口阈值后触发自动结构化折叠。"""
+        if self.runtime_features.folding_mode == "off":
+            return
         if self.last_input_token_count > self.effective_window * AUTO_COMPACT_THRESHOLD:
             print_info("Context window filling up, compacting conversation...")
             await self._compact_conversation(trigger="auto")
 
     async def _compact_conversation(self, *, trigger: str = "manual")->bool:
         """按当前协议折叠上下文，并返回本次是否真的发生压缩。"""
+        if self.runtime_features.folding_mode == "off":
+            self._trace_event("fold_skipped", trigger=trigger, reason="folding_disabled")
+            return False
+        if self.runtime_features.max_folds is not None and self._fold_count >= self.runtime_features.max_folds:
+            self._trace_event("fold_skipped", trigger=trigger, reason="max_folds_reached")
+            return False
+        before_messages = self._openai_messages if self.use_openai else self._anthropic_messages
+        before_count = len(before_messages)
+        before_chars = len(json.dumps(_sanitize_for_utf8(before_messages), ensure_ascii=False, default=str))
         if self.use_openai:
             compacted = await self._compact_openai(trigger=trigger)
         else:
             compacted = await self._compact_anthropic(trigger=trigger)
         if compacted:
+            after_messages = self._openai_messages if self.use_openai else self._anthropic_messages
+            after_chars = len(json.dumps(_sanitize_for_utf8(after_messages), ensure_ascii=False, default=str))
+            memory = self._folded_session_memories[-1] if self._folded_session_memories else {}
+            self._trace_event(
+                "fold",
+                trigger=trigger,
+                before_message_count=before_count,
+                after_message_count=len(after_messages),
+                before_chars=before_chars,
+                after_chars=after_chars,
+                compression_ratio=(after_chars / before_chars) if before_chars else 1.0,
+                fallback=(
+                    (memory.get("episode_memory") or {}).get("task_description")
+                    == "Previous conversation was compacted without structured JSON."
+                ),
+                memory=memory,
+            )
             print_info("Conversation compacted.")
         return compacted
 
@@ -1011,6 +1175,8 @@ class Agent:
             **memory,
         }
         self._folded_session_memories.append(record)
+        if not self.runtime_features.auto_save:
+            return
         try:
             save_folded_session_memory(self.session_id, _sanitize_for_utf8(record))
         except Exception:
@@ -1194,12 +1360,36 @@ class Agent:
     #执行工具入口(cy)
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
+        self._trace_event("tool_call", phase="start", name=name, input=inp)
+        started = time.perf_counter()
+        try:
+            result = await self._dispatch_tool_call(name, inp)
+        except Exception as error:
+            self._trace_event("tool_call", phase="end", name=name, input=inp,
+                              error=str(error), latency_s=time.perf_counter() - started)
+            raise
+        self._trace_event("tool_call", phase="end", name=name, input=inp, output=result,
+                          latency_s=time.perf_counter() - started)
+        return result
+
+    async def _dispatch_tool_call(self, name: str, inp: dict) -> str:
         """统一分发折叠、Plan、子 Agent、Skill、MCP 与普通内置工具。
 
         这层是工具路由器，不负责理解模型意图。外层协议循环已经解析参数并完成权限检查；
         这里根据工具名选择真正的 Python 实现，最后统一返回字符串。该字符串随后会被包装成
         ``tool_result`` 或 ``role=tool`` 消息，成为模型下一次 API 请求的新观察结果。
         """
+        if self.runtime_features.skill_mode == "off" and name in SKILL_TOOL_NAMES:
+            return f"Tool disabled by runtime feature: {name}"
+        if self.runtime_features.skill_mode == "static" and name in SKILL_MUTATION_TOOL_NAMES:
+            return f"Tool disabled by static Skill mode: {name}"
+        if self.runtime_features.folding_mode == "off" and name in FOLD_TOOL_NAMES:
+            return f"Tool disabled by runtime feature: {name}"
+        if self._custom_tool_executor is not None and name in self._custom_tool_names:
+            custom_result = self._custom_tool_executor(name, inp)
+            if inspect.isawaitable(custom_result):
+                custom_result = await custom_result
+            return _safe_utf8_text(custom_result)
         # 这些工具要读写 Agent 自身状态，因此留在 Runtime 内处理，不能当成普通文件工具。
         if name == "compact_context":
             return await self._execute_compact_context_tool(inp)
@@ -1214,6 +1404,15 @@ class Agent:
             return await self._mcp_manager.call_tool(name, inp)
         # 其余名称落到 tools.py：这里包含读写文件、搜索、Shell 等内置能力。
         result = await execute_tool(name, inp, self._read_file_state)
+        if name == "tool_search":
+            try:
+                schemas = json.loads(result)
+                allowed_names = {tool.get("name") for tool in self.tools}
+                if isinstance(schemas, list):
+                    schemas = [schema for schema in schemas if schema.get("name") in allowed_names]
+                    result = json.dumps(schemas, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
         if name in {"skill_create", "skill_evolve"}:
             try:
                 parsed = json.loads(result)
@@ -1243,6 +1442,8 @@ class Agent:
     async def _execute_skill_tool(self, inp: dict) -> str:
         from .skills import execute_skill
         result = execute_skill(inp.get("skill_name", ""), inp.get("args", ""))
+        self._trace_event("skill_activation", skill_name=inp.get("skill_name", ""),
+                          found=bool(result), context=(result or {}).get("context"))
 
         if not result:
             return f"Unknown skill: {inp.get('skill_name', '')}"
@@ -1272,6 +1473,8 @@ class Agent:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
                 self.total_input_tokens += sub_result["tokens"]["input"]
                 self.total_output_tokens += sub_result["tokens"]["output"]
+                self.side_input_tokens += sub_result["tokens"].get("side_input", 0)
+                self.side_output_tokens += sub_result["tokens"].get("side_output", 0)
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
                 return sub_result["text"] or "(Skill produced no output)"
             except Exception as e:
@@ -1389,6 +1592,8 @@ class Agent:
             result = await sub_agent.run_once(prompt)
             self.total_input_tokens += result["tokens"]["input"]
             self.total_output_tokens += result["tokens"]["output"]
+            self.side_input_tokens += result["tokens"].get("side_input", 0)
+            self.side_output_tokens += result["tokens"].get("side_output", 0)
             print_sub_agent_end(agent_type, description)
             return result["text"] or "(Sub-agent produced no output)"
         except Exception as e:
@@ -1488,9 +1693,15 @@ class Agent:
             self.total_input_tokens += response.usage.input_tokens
             self.total_output_tokens += response.usage.output_tokens
             self.last_input_token_count = response.usage.input_tokens
+            self._trace_event("model_call", protocol="anthropic", input_tokens=response.usage.input_tokens,
+                              output_tokens=response.usage.output_tokens)
 
             # Anthropic 的响应内容里可能混有 text block 和 tool_use block，这里只挑出工具调用。
             tool_uses = [b for b in response.content if b.type == "tool_use"]
+            self._trace_event(
+                "model_response", protocol="anthropic",
+                content=[self._block_to_dict(block) for block in response.content],
+                stop_reason=getattr(response, "stop_reason", None))
 
             # 把模型返回的所有 content block 写入消息历史，后续 tool_result 要与这些 tool_use 对应。
             self._anthropic_messages.append({
@@ -1510,6 +1721,7 @@ class Agent:
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
+                self._stop_reason = str(budget["reason"])
                 self._anthropic_messages.append({
                     "role": "user",
                     "content": [
@@ -1638,6 +1850,8 @@ class Agent:
             #如果开启了思考模式，就给 Anthropic 请求加上 thinking 参数。
             if self._thinking_mode  in ("adaptive", "enabled"):
                 create_params["thinking"]={"type": "enabled", "budget_tokens": max_output - 1}
+            elif self.runtime_features.temperature is not None:
+                create_params["temperature"] = self.runtime_features.temperature
 
             first_text = True
 
@@ -1780,12 +1994,16 @@ class Agent:
                 self.total_input_tokens += response["usage"]["prompt_tokens"]
                 self.total_output_tokens += response["usage"]["completion_tokens"]
                 self.last_input_token_count = response["usage"]["prompt_tokens"]
+                self._trace_event("model_call", protocol="openai", input_tokens=response["usage"]["prompt_tokens"],
+                                  output_tokens=response["usage"]["completion_tokens"])
 
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
             message = choice.get("message", {})
 
             # assistant 消息必须先入历史。后面追加的 role=tool 要用 tool_call_id 指向它。
             self._openai_messages.append(message)
+            self._trace_event("model_response", protocol="openai", message=message,
+                              stop_reason=choice.get("finish_reason"))
 
             tool_calls = message.get("tool_calls")
 
@@ -1799,6 +2017,7 @@ class Agent:
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
+                self._stop_reason = str(budget["reason"])
                 break
 
             oai_checked: list[dict] = []
@@ -1915,14 +2134,17 @@ class Agent:
     async def _call_openai_stream(self) -> dict:
         """消费 OpenAI 流式分片，组装成协议循环易于处理的一条完整响应。"""
         async def _do():
-            stream = await self._openai_client.chat.completions.create(
-                model=self.model,
+            create_params: dict[str, Any] = {
+                "model": self.model,
                 # schema 只告诉模型“可以请求哪些函数”；真正执行发生在 _execute_tool_call。
-                tools=_sanitize_for_utf8(_to_openai_tools(get_active_tool_definitions(self.tools))),
-                messages=_sanitize_for_utf8(self._openai_messages),
-                stream=True,
-                stream_options={"include_usage": True},
-            )
+                "tools": _sanitize_for_utf8(_to_openai_tools(get_active_tool_definitions(self.tools))),
+                "messages": _sanitize_for_utf8(self._openai_messages),
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            if self.runtime_features.temperature is not None:
+                create_params["temperature"] = self.runtime_features.temperature
+            stream = await self._openai_client.chat.completions.create(**create_params)
 
             content = ""
             first_text = True

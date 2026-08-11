@@ -222,7 +222,7 @@ def get_git_context() -> str:
         return ""
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(*, include_skills: bool = True) -> str:
     """组装当前运行环境的完整 system prompt。
 
     system prompt 是 Harness 每次请求携带的运行时说明书：除了行为规则，还包含工作目录、
@@ -237,10 +237,15 @@ def build_system_prompt() -> str:
     git_context = get_git_context()
     claude_md = load_claude_md()
     memory_section = build_memory_prompt_section()
-    skills_section = build_skill_descriptions()
+    skills_section = build_skill_descriptions() if include_skills else ""
     agent_section = build_agent_descriptions()
 
     deferred_names = get_deferred_tool_names()
+    if not include_skills:
+        deferred_names = [
+            name for name in deferred_names
+            if name not in {"skill", "skill_create", "skill_evolve"}
+        ]
     # deferred 工具只暴露名称；模型先调用 tool_search，下一轮才获得完整 schema。
     deferred_section = (
         f"\n\nThe following deferred tools are available via tool_search: {', '.join(deferred_names)}. Use tool_search to fetch their full schemas when needed."

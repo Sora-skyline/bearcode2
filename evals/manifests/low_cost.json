@@ -1,0 +1,36 @@
+{
+  "skill": {
+    "families": {
+      "BookHotel": {
+        "add": "BookHotel-level-1-2.jsonl",
+        "merge": "BookHotel-level-1-3.jsonl",
+        "discard": "BookHotel-level-1-4.jsonl",
+        "heldout": "BookHotel-level-1-5.jsonl"
+      },
+      "QueryStock": {
+        "add": "QueryStock-level-1-1.jsonl",
+        "merge": "QueryStock-level-1-2.jsonl",
+        "discard": "QueryStock-level-1-3.jsonl",
+        "heldout": "QueryStock-level-1-4.jsonl"
+      }
+    },
+    "unrelated": "QueryRegistration-level-1-1.jsonl"
+  },
+  "folding": {
+    "ids": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "minimum_subtasks": 4
+  },
+  "gaia": {
+    "ids": [
+      1,
+      2,
+      6,
+      12
+    ]
+  }
+}
