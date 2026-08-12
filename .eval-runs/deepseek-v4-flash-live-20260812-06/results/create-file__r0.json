@@ -1,0 +1,54 @@
+{
+  "approval_decisions": 1,
+  "category": "file-edit",
+  "cost_usd": 0.0016517200000000002,
+  "error": null,
+  "final_answer": "Created `result.txt` containing exactly `ready` followed by a newline. Task complete.",
+  "final_answer_sha256": "d186d9010cf394a4437926a557db4de1edb81b0a8a5103c613c69541248baf77",
+  "latency_ms": 4138.91,
+  "passed": true,
+  "peak_context_tokens": 5830,
+  "prediction_sha256": "d186d9010cf394a4437926a557db4de1edb81b0a8a5103c613c69541248baf77",
+  "replicate": 0,
+  "run_id": "deepseek-v4-flash-live-20260812-06",
+  "schema_version": "1.0",
+  "score": 1.0,
+  "scoring": {
+    "details": "all child scorers passed",
+    "evidence": {
+      "children": [
+        {
+          "details": "file_equals check",
+          "evidence": {
+            "actual_sha256": "f5068869ee558af5e782e8f5fa7f6fcea01b4ccc2b12209b6be88b75a2e39a6d",
+            "path": "result.txt"
+          },
+          "passed": true,
+          "score": 1.0
+        },
+        {
+          "details": "trajectory event match",
+          "evidence": {
+            "matches": 1,
+            "minimum": 1
+          },
+          "passed": true,
+          "score": 1.0
+        }
+      ]
+    },
+    "passed": true,
+    "score": 1.0
+  },
+  "status": "completed",
+  "task_id": "create-file",
+  "task_sha256": "476ec067cf47d132bd1ef8beaaa21a0c18518392e21df59d52e6a42718f4db60",
+  "tokens": {
+    "input": 11536,
+    "output": 131
+  },
+  "tool_calls": 1,
+  "trajectory_path": "trajectories/create-file__r0.jsonl",
+  "trajectory_sha256": "2c7c24f3ebecd2d886e3a04e634f8540fc85ea79d1492c656af1ff1c42937319",
+  "turns": 1
+}

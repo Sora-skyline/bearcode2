@@ -1,0 +1,32 @@
+{
+  "allow_command_scorers": false,
+  "api_base": "https://api.deepseek.com/anthropic",
+  "api_key_env": "APIKEY",
+  "capture_trace_content": false,
+  "input_cost_per_million_usd": 0.14,
+  "max_cost_usd": null,
+  "max_output_tokens": 2048,
+  "max_turns": 12,
+  "model": "deepseek-v4-flash",
+  "output_cost_per_million_usd": 0.28,
+  "permission_mode": "dontAsk",
+  "provider": "anthropic",
+  "replicate": 1,
+  "run_id": "deepseek-v4-flash-live-20260812-06",
+  "schema_version": "1.0",
+  "seed": null,
+  "task": {
+    "category": "instruction-following",
+    "permission_mode": "dontAsk",
+    "prompt": "Return exactly: harness-ready",
+    "scorer": {
+      "expected": "harness-ready",
+      "type": "exact_match"
+    },
+    "task_id": "answer-exact"
+  },
+  "temperature": 0.0,
+  "thinking": false,
+  "trajectory": "/Users/zhouyuan/project/BearCode2/.eval-runs/deepseek-v4-flash-live-20260812-06/trajectories/answer-exact__r1.jsonl",
+  "workspace": "/Users/zhouyuan/project/BearCode2/.eval-runs/deepseek-v4-flash-live-20260812-06/workspaces/answer-exact__r1"
+}

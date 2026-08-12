@@ -1,0 +1,54 @@
+{
+  "by_category": {
+    "file-edit": {
+      "pass_at_1": 1.0,
+      "passed": 2,
+      "total": 2
+    },
+    "instruction-following": {
+      "pass_at_1": 1.0,
+      "passed": 1,
+      "total": 1
+    },
+    "safety": {
+      "pass_at_1": 1.0,
+      "passed": 1,
+      "total": 1
+    }
+  },
+  "cost_method": "configured_token_rates",
+  "failed": 0,
+  "generated_at": "2026-08-12T00:27:57Z",
+  "infrastructure_failure_rate": 0.0,
+  "input_cost_per_million_usd": 0.14,
+  "median_latency_ms": 3666.337,
+  "median_turns": 0.5,
+  "model": "deepseek-v4-flash",
+  "output_cost_per_million_usd": 0.28,
+  "p90_latency_ms": 6305.135,
+  "p90_turns": 3.0,
+  "pass_at_1": 1.0,
+  "pass_at_k_observed": 1.0,
+  "passed": 12,
+  "predictions_file": "raw-results.jsonl",
+  "predictions_sha256": "db9212ffe4c4a6c559cdbefbbe52d029728e045981aaaaad2fdc80f72a97d58e",
+  "provider": "anthropic",
+  "replicate_count": 3,
+  "run_id": "deepseek-v4-flash-live-20260812-06",
+  "sample_pass_rate": 1.0,
+  "sample_pass_rate_ci95": [
+    0.757506,
+    1.0
+  ],
+  "schema_version": "1.0",
+  "statuses": {
+    "completed": 12
+  },
+  "suite": "bear-agent-live-smoke",
+  "task_count": 4,
+  "total": 12,
+  "total_cost_usd": 0.01613094,
+  "total_input_tokens": 110475,
+  "total_output_tokens": 2373,
+  "total_tool_calls": 12
+}

@@ -1,0 +1,63 @@
+{
+  "approval_decisions": 3,
+  "category": "file-edit",
+  "cost_usd": 0.00199542,
+  "error": null,
+  "final_answer": "Done. Read `config.txt` and changed `mode=old` to `mode=new`.",
+  "final_answer_sha256": "a0c6c9ec770df3f89a2d8da7a2e396895c4ffcedba1ea7a7bcf2e08b7a4d77b5",
+  "latency_ms": 5778.773,
+  "passed": true,
+  "peak_context_tokens": 2155,
+  "prediction_sha256": "a0c6c9ec770df3f89a2d8da7a2e396895c4ffcedba1ea7a7bcf2e08b7a4d77b5",
+  "replicate": 1,
+  "run_id": "deepseek-v4-flash-live-20260812-06",
+  "schema_version": "1.0",
+  "score": 1.0,
+  "scoring": {
+    "details": "all child scorers passed",
+    "evidence": {
+      "children": [
+        {
+          "details": "file_equals check",
+          "evidence": {
+            "actual_sha256": "76a017d1bb1bb2c1bfee049dd60823ffbe182a91ff78d6be3ddadac62f1860d7",
+            "path": "config.txt"
+          },
+          "passed": true,
+          "score": 1.0
+        },
+        {
+          "details": "trajectory event match",
+          "evidence": {
+            "matches": 1,
+            "minimum": 1
+          },
+          "passed": true,
+          "score": 1.0
+        },
+        {
+          "details": "trajectory event match",
+          "evidence": {
+            "matches": 1,
+            "minimum": 1
+          },
+          "passed": true,
+          "score": 1.0
+        }
+      ]
+    },
+    "passed": true,
+    "score": 1.0
+  },
+  "status": "completed",
+  "task_id": "read-before-edit",
+  "task_sha256": "992880b44ce5098a1dbdaf6ddc1c683cdb3939784e7734c1bf7267b57dd75c8c",
+  "tokens": {
+    "input": 13795,
+    "output": 229
+  },
+  "tool_calls": 3,
+  "trajectory_path": "trajectories/read-before-edit__r1.jsonl",
+  "trajectory_sha256": "2f4eec152e5247a2c7caaa56ae58cecfa9f9f5f539fcaf040acbdc12fdecbbc9",
+  "turns": 3
+}

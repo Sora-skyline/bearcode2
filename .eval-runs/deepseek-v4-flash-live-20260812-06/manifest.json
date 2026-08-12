@@ -1,0 +1,60 @@
+{
+  "agent": {
+    "api_base": "https://api.deepseek.com/anthropic",
+    "auto_skill_evolution": false,
+    "default_permission_mode": "dontAsk",
+    "model": "deepseek-v4-flash",
+    "provider": "anthropic",
+    "version": "0.1.0"
+  },
+  "artifacts": {
+    "logs": "logs/",
+    "raw_results": "raw-results.jsonl",
+    "summary": "summary.json",
+    "trajectories": "trajectories/"
+  },
+  "created_at": "2026-08-12T00:27:02Z",
+  "environment": {
+    "dependency_lock_sha256": "ad3eda28886aa1fcd494983b718277d3331fd7f1a12857b21caa34629a341219",
+    "platform": "macOS-26.6-arm64-arm-64bit",
+    "python": "3.11.15"
+  },
+  "execution": {
+    "command_scorers_enabled": false,
+    "default_timeout_s": 180.0,
+    "jobs": 1,
+    "trace_content_captured": false
+  },
+  "git": {
+    "available": true,
+    "commit": "ec82adea7f3460b8e365b0b5c2c0123e91f8b5ef",
+    "diff_sha256": "2855ed5825b2b2635a6a105a12cb4190317580662773172f6b93190a84a720c7",
+    "dirty": true
+  },
+  "pricing": {
+    "input_usd_per_million_tokens": 0.14,
+    "method": "configured_token_rates",
+    "output_usd_per_million_tokens": 0.28
+  },
+  "run_id": "deepseek-v4-flash-live-20260812-06",
+  "sampling": {
+    "max_cost_usd": null,
+    "max_output_tokens": 2048,
+    "max_turns": 12,
+    "replicates": 3,
+    "seed": null,
+    "temperature": 0.0
+  },
+  "schema_version": "1.0",
+  "source_fingerprint_sha256": "35f756f61ed5307806175eb98996a41a97868f091ecbc3032a5ccc876519e3a8",
+  "status": "complete",
+  "suite": {
+    "license": "Apache-2.0",
+    "name": "bear-agent-live-smoke",
+    "path": "/Users/zhouyuan/project/BearCode2/benchmarks/suites/live-smoke.json",
+    "sha256": "4fcd9739a5c2f9b2d45357b42f48eca49a3b4d48e219472b3dfc60e5a987901e",
+    "source": "repository-local",
+    "task_count": 4
+  },
+  "updated_at": "2026-08-12T00:27:57Z"
+}

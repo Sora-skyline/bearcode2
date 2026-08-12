@@ -1,0 +1,35 @@
+{
+  "approval_decisions": 0,
+  "category": "instruction-following",
+  "cost_usd": 0.0008020600000000001,
+  "error": null,
+  "final_answer": "harness-ready",
+  "final_answer_sha256": "b067c3c35c05300566faba990e637a68a80a8a09a991ef42c427502fa6374656",
+  "latency_ms": 1661.548,
+  "passed": true,
+  "peak_context_tokens": 5697,
+  "prediction_sha256": "b067c3c35c05300566faba990e637a68a80a8a09a991ef42c427502fa6374656",
+  "replicate": 1,
+  "run_id": "deepseek-v4-flash-live-20260812-06",
+  "schema_version": "1.0",
+  "score": 1.0,
+  "scoring": {
+    "details": "final answer exact match",
+    "evidence": {
+      "expected_sha256": "b067c3c35c05300566faba990e637a68a80a8a09a991ef42c427502fa6374656"
+    },
+    "passed": true,
+    "score": 1.0
+  },
+  "status": "completed",
+  "task_id": "answer-exact",
+  "task_sha256": "7a0c104c7c7cc354678a04988c99397c96bf955bd8cdf8f25cafaadfde493588",
+  "tokens": {
+    "input": 5697,
+    "output": 16
+  },
+  "tool_calls": 0,
+  "trajectory_path": "trajectories/answer-exact__r1.jsonl",
+  "trajectory_sha256": "ec392e93159c30c5c9e5c863cbdab2757a38521ced1ebef2cbf6aac7177871f8",
+  "turns": 0
+}
