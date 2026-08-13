@@ -1,0 +1,9 @@
+agents/agent.py
+  h_980cd48a740375 1860,1867,1874-1875
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "3.2.115",
+  "base_commit_sha": "3b7ee18277461e2695feafdc128d5f05507d85a6",
+  "prompts": {}
+}
