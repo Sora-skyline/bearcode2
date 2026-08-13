@@ -341,7 +341,7 @@ async def online_ingest(
     )
     return result
 
-
+# 让一个额外的 LLM 在回答完成后做“行为判断”；它不参与生成主回答。
 async def judge_retrieved_skill_usage(
     *,
     hits: list[dict[str, Any]],
@@ -349,11 +349,15 @@ async def judge_retrieved_skill_usage(
     assistant_text: str,
     side_query: SideQuery | None = None,
 ) -> list[dict[str, Any]]:
-    """逐个判断检索命中是否相关、回答是否实际使用，供 usage gate 累积统计。"""
+    """逐个判断检索命中是否相关、回答是否体现其流程，供 usage gate 累积统计。
+
+    ``used`` 是裁判从最终回答表现推断出的行为信号，不是对 ``skill`` tool call 的审计。
+    """
     if not hits:
         return []
     if side_query is None:
-        # 无 judge 时只能用名称是否出现在回答中的弱启发式，relevant 保守记为 False。
+        # 无可用模型客户端时退化为弱启发式：回答中出现 Skill 名才算 used。
+        # 名称出现不能证明 Skill 适合用户请求，所以 relevant 保守记为 False。
         assistant_lower = assistant_text.lower()
         return [
             {
@@ -369,25 +373,32 @@ async def judge_retrieved_skill_usage(
             for hit in hits
         ]
 
+    # 裁判标准刻意区分“检索到了”和“真正采用了”：只有回答遵循候选 Skill
+    # 的独特流程或策略才算 used，不能仅因候选出现在输入中就判为使用。
     system = (
         "Judge whether retrieved skills were relevant to the user request and actually used in the assistant reply.\n"
         "Output ONLY strict JSON: {\"judgments\":[{\"name\":\"...\",\"relevant\":true|false,\"used\":true|false,\"reason\":\"short\"}]}.\n"
         "A skill is used only if the reply follows its distinctive workflow or policy, not merely because it was retrieved."
     )
+    # side query 与主消息历史隔离，只接收完成判断所需的最小证据。
+    # hits 是检索摘要而非完整 SKILL.md，因此这个结论属于语义推断。
     payload = {"user_message": user_message, "assistant_reply": assistant_text, "retrieved_skills": hits}
     parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
-    # 按名称与原始 hits 对齐，保证每个 retrieved 候选都产生一条统计记录。
+    # 裁判输出可能缺项、乱序或包含额外项；先按名称建立索引，再以原始 hits 为准对齐，
+    # 保证每个实际 retrieved 的候选恰好产生一条统计记录。
     raw_judgments = parsed.get("judgments") if isinstance(parsed.get("judgments"), list) else []
     by_name = {str(item.get("name") or ""): item for item in raw_judgments if isinstance(item, dict)}
     judgments: list[dict[str, Any]] = []
     for hit in hits:
         name = str(hit.get("name") or "")
+        # 裁判漏掉某项或 JSON 解析失败时 raw 为空，下面两个 bool 会安全降级为 False。
         raw = by_name.get(name, {})
         judgments.append(
             {
                 "name": name,
                 "source": hit.get("source", ""),
                 "skill_dir": hit.get("skill_dir", ""),
+                # retrieved 是 Runtime 已知事实；relevant/used 才是裁判模型给出的判断。
                 "retrieved": True,
                 "relevant": bool(raw.get("relevant")),
                 "used": bool(raw.get("used")),

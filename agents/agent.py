@@ -503,17 +503,27 @@ class Agent:
         finally:
             self._current_task = None
         # 阶段 4：主回复完成后再做统计与在线演化，避免辅助模型请求增加响应延迟。
+        # _emit_text() 在本轮 Agent Loop 中持续写入该缓冲区；这里将流式文本片段
+        # 合并为完整回复，供 Skill 使用情况评估和下一轮的演化证据窗口复用。
         assistant_text = "".join(self._turn_output_buffer or []).strip()
+        # 本轮收集已经结束，及时置空可避免后续非 chat 输出被误计入本轮回复。
         self._turn_output_buffer = None
+        # 子 Agent 不负责全局 Skill 学习；被用户中止的回复也不应作为有效样本。
         if not self.is_sub_agent and not self._aborted:
+            # 后台判断本轮自动检索出的 Skill 是否相关、是否真正被模型采用。
             self._schedule_background_skill_task(self._run_skill_usage_tracking(original_user_message, assistant_text))
+            # ready_skill_extraction_window 属于上一轮：当前用户输入已经作为对上一轮结果的
+            # 反馈补入窗口，因此现在可以异步提炼或演化可复用的 Skill。
             if ready_skill_extraction_window:
                 self._schedule_background_skill_task(self._run_online_skill_evolution(ready_skill_extraction_window))
+            # 暂存当前问答以及本轮最高分 Skill 引用；等下一条用户消息到来后，
+            # 再把那条消息视为结果反馈，组成下一次在线演化的完整证据窗口。
             self._set_pending_skill_extraction_window(
                 original_user_message=original_user_message,
                 assistant_text=assistant_text,
                 retrieved_reference=self._last_retrieved_skill_reference,
             )
+        # 只有主 Agent 负责终端轮次分隔和会话持久化，避免子 Agent 污染主界面与存档。
         if not self.is_sub_agent:
             print_divider()
             self._auto_save()
@@ -773,27 +783,42 @@ class Agent:
             print_error(f"Online skill evolution failed: {result.get('error') or result}")
 
     async def _run_skill_usage_tracking(self, original_user_message: str, assistant_text: str) -> None:
-        """判断检索命中的 Skill 是否真正相关/被使用，更新可审计统计。"""
+        """让独立裁判模型评估检索命中的 Skill，并更新可审计的累计统计。
+
+        这里的 ``used`` 是根据最终回答是否体现 Skill 的独特流程推断出来的，不代表
+        Runtime 已确认主模型实际调用过 ``skill`` 工具；显式调用由 invocation 日志另记。
+        """
+        # 在线演化关闭时不产生任何辅助请求；Plan Mode 保持只读，也不更新统计文件。
         if not self._online_evolution_enabled() or self.permission_mode == "plan":
             return
+        # 这些命中来自本轮请求前的自动检索，包含名称、描述、when_to_use、检索分数等，
+        # 但不包含完整 SKILL.md 正文。
         hits = list(self._last_retrieved_skill_hits or [])
+        # 没有候选就无从判断；空回复通常表示模型未正常完成，也不作为有效使用样本。
         if not hits or not assistant_text.strip():
             return
+        # side_query 使用相同模型发起一条与主对话历史隔离的辅助请求；700 token
+        # 只供输出结构化判断，不会把裁判过程写回主 Agent 的消息列表。
         side_query = self._build_side_query(max_tokens=700)
         try:
             from .online_skill_evolution import judge_retrieved_skill_usage
             from .skills import record_usage_judgments
 
+            # 裁判同时看到原始用户请求、最终回复和候选摘要，并为每个候选返回
+            # relevant（是否适用）与 used（回答是否体现其特有流程）。
             judgments = await judge_retrieved_skill_usage(
                 hits=hits,
                 user_message=original_user_message,
                 assistant_text=assistant_text,
                 side_query=side_query,
             )
+            # 将本轮判断累加到 skill_usage_stats.json；达到长期无效阈值时可能归档 Skill。
             result = record_usage_judgments(judgments)
             if result.get("pruned"):
+                # 归档会改变当前可用 Skill 清单，因此必须重建 system prompt。
                 self._refresh_runtime_system_prompt()
         except Exception:
+            # 统计属于回答后的尽力而为任务，裁判或写盘失败不能影响已经完成的主回复。
             return
 
     async def extract_now(self, hint: str = "") -> dict[str, Any]:
@@ -1850,25 +1875,35 @@ class Agent:
                     else:
                         oai_batches.append({"concurrent": safe, "items": [ct]})
 
+                # 当前工具执行阶段的熔断标记。某个工具若触发上下文压缩，后续批次必须停止，
+                # 避免继续执行基于旧消息历史生成的工具调用。
                 oai_context_break = False
                 for batch in oai_batches:
+                    # 用户中止或上下文已经被替换时，不再消费尚未执行的批次。
                     if oai_context_break or self._aborted:
                         break
-                    #并发批次执行
+                    # 并发批次只包含已通过权限检查、且声明为无副作用的工具。
                     if batch["concurrent"]:
                         async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                            # 每个任务独立执行工具并规范化结果；过大的结果会先落盘，
+                            # 返回可安全放进模型上下文的预览或文件引用。
                             raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
                             raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct_item["fn"], raw)# 关联你最开始看的三层上下文压缩
+                            res = self._persist_large_result(ct_item["fn"], raw)
                             print_tool_result(ct_item["fn"], res)
+                            # 连同原始调用信息返回，以便稍后取出对应的 tool_call_id。
                             return ct_item, res
 
+                        # gather 保持结果顺序与 batch["items"] 一致，同时缩短多个只读工具的总耗时。
                         results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                        for ct_item, res in results:# 循环写入 OpenAI 标准消息
+                        for ct_item, res in results:
+                            # 记录运行质量信号，供上下文折叠策略判断连续失败和重复调用。
                             self._record_tool_outcome(
                                 ct_item["fn"],
                                 not self._looks_like_tool_failure(ct_item["fn"], "", res),
                             )
+                            # OpenAI 协议要求每个工具结果用 tool_call_id 与 assistant 的调用一一对应；
+                            # 下一次模型请求会携带这些 role=tool 消息，让模型继续推理。
                             self._openai_messages.append(
                                 {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                     else: # 串行批次执行

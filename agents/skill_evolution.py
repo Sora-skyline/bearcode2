@@ -485,13 +485,17 @@ def evolve_skill_file(
 
 def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, Any]:
     """累计 retrieved/relevant/used 统计，并检查长期无效 Skill 是否需要归档。"""
+    # 统计按项目隔离保存在 .bear/skill-evolution/skill_usage_stats.json。
     stats_path = get_evolution_dir() / SKILL_USAGE_STATS
+    # 文件不存在或内容不可用时从空字典开始；已有统计则在原计数上继续累加。
     stats = _read_json(stats_path, {})
     pruned: list[str] = []
     for judgment in judgments:
+        # 同时兼容裁判输出的 name 和历史调用方使用的 skill 字段。
         skill = str(judgment.get("name") or judgment.get("skill") or "").strip()
         if not skill:
             continue
+        # 第一次观察该 Skill 时建立累计结构；以后 setdefault 会保留已有计数。
         item = stats.setdefault(
             skill,
             {
@@ -509,13 +513,17 @@ def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, A
         item["last_retrieved"] = _utc_now()
         item["source"] = judgment.get("source", item.get("source", ""))
         item["skill_dir"] = judgment.get("skill_dir", item.get("skill_dir", ""))
+        # relevant 表示 Skill 适合本次用户请求，与最终回答是否采用它是两个维度。
         if judgment.get("relevant"):
             item["relevant"] = int(item.get("relevant", 0)) + 1
+        # used 是裁判根据最终回答推断的行为信号；真实显式调用由 usage.jsonl 另行记录。
         if judgment.get("used"):
             item["used"] = int(item.get("used", 0)) + 1
             item["last_used"] = _utc_now()
+        # 保留最近一次裁判理由和本轮检索分数，便于人工审计误判或检索质量。
         item["last_reason"] = _preview(judgment.get("reason", ""), 500)
         item["last_score"] = judgment.get("score", 0)
+        # 每次累计后立即检查阈值；满足条件时移动到归档目录，而不是永久删除。
         if _maybe_prune_stale_skill(skill, item):
             pruned.append(skill)
     # 主统计写盘后同步到 provenance 索引，lineage 报告可直接查看最新使用数据。
@@ -526,24 +534,27 @@ def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, A
 
 def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
     """证据量达到环境阈值且长期未使用时，将 Skill 移入可审计归档目录。"""
+    # 默认需至少被检索 40 次且 used 不超过 0 次；环境变量可调整这两个门槛。
     min_retrieved = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MIN_RETRIEVED"), 40)
     max_used = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MAX_USED"), 0)
     source = str(stats.get("source") or "").strip().lower()
     # 默认只自动归档用户级 Skill；项目级必须显式开启环境变量。
     if source != "user" and os.environ.get("BEAR_SKILL_PRUNE_PROJECT", "").strip().lower() not in {"1", "true", "yes", "on"}:
         return False
-    # 达到最小观察量后，used 仍不超过阈值才被视为 stale。
+    # 样本不足时不下结论；只要 used 高于允许上限，也不能视为长期无效。
     if int(stats.get("retrieved", 0)) < min_retrieved:
         return False
     if int(stats.get("used", 0)) > max_used:
         return False
     skill_dir = Path(str(stats.get("skill_dir") or ""))
+    # 只移动仍然存在的普通 Skill 目录；缺失路径和隐藏目录都拒绝处理。
     if not skill_dir.is_dir():
         return False
     if skill_dir.name.startswith("."):
         return False
     archive_root = get_evolution_dir() / "pruned"
     archive_root.mkdir(parents=True, exist_ok=True)
+    # 时间戳避免同名 Skill 多次归档时覆盖旧版本。
     destination = archive_root / f"{_safe_skill_slug(skill_name)}-{int(time.time())}"
     try:
         # 使用移动而非删除，保留完整 Skill 供审计或人工恢复。

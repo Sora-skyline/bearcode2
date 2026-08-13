@@ -476,7 +476,9 @@ def skill_stats() -> str:
 
 def record_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, Any]:
     """写入检索 Skill 的 relevant/used 判断，并在归档发生后刷新发现缓存。"""
+    # skills.py 只提供面向 Agent 的门面；累计计数和归档策略集中在持久化模块中。
     result = record_skill_usage_judgments(judgments)
     if result.get("pruned"):
+        # 已归档目录不能继续留在进程缓存里；下次 discover_skills() 将重新扫描磁盘。
         reset_skill_cache()
     return result
