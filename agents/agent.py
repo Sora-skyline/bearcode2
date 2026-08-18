@@ -510,7 +510,7 @@ class Agent:
         self._turn_output_buffer = None
         # 子 Agent 不负责全局 Skill 学习；被用户中止的回复也不应作为有效样本。
         if not self.is_sub_agent and not self._aborted:
-            # 后台判断本轮自动检索出的 Skill 是否相关、是否真正被模型采用。
+            # 把任务丢进后台异步执行，不阻塞主对话响应, 后台判断本轮自动检索出的 Skill 是否相关、是否真正被模型采用。
             self._schedule_background_skill_task(self._run_skill_usage_tracking(original_user_message, assistant_text))
             # ready_skill_extraction_window 属于上一轮：当前用户输入已经作为对上一轮结果的
             # 反馈补入窗口，因此现在可以异步提炼或演化可复用的 Skill。
@@ -768,7 +768,7 @@ class Agent:
             return
 
         result = await online_ingest(
-            messages=messages,
+            messages=messages, # 「问题 + agent 回答 + 用户反馈」
             side_query=side_query,
             retrieved_reference=window.get("retrieved_reference") or None,
             hint=str(window.get("hint") or ""),
