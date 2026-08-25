@@ -75,7 +75,7 @@ REPL 命令入口：
   -> 对历史 latest_assistant 执行规则评测
   -> 基于失败规则生成候选变体
   -> 用候选变体重新生成 replay 回复并评测
-  -> 合并 retrieved / relevant / used
+  -> 合并 retrieved / surfaced / invoked / inferred_used
   -> 计算 status
   -> 判断 champion promotion
   -> 写出 report 和 run artifacts
@@ -173,7 +173,7 @@ evaluate_online_skill_evolution(
 |------|------|
 | `online_provenance.jsonl` | 每次在线沉淀的原始事件，包含 action、skill、messages、decision、error |
 | `online_skill_provenance.json` | 按 Skill 聚合后的在线来源索引 |
-| `skill_usage_stats.json` | Skill 被检索、相关、实际使用的统计 |
+| `skill_usage_stats.json` | Skill 的 retrieved、surfaced、invoked 与 inferred_used 分层统计 |
 | `usage.jsonl` | create、invoke、feedback、evolve、prune 等生命周期事件 |
 | `history/*.jsonl` | Skill 演化前快照 |
 
@@ -794,18 +794,20 @@ pass / reason
 | 字段 | 含义 |
 |------|------|
 | `retrieved` | 被检索出来的次数 |
+| `surfaced` | 摘要实际注入模型上下文的次数 |
 | `relevant` | 被判断为和用户请求相关的次数 |
-| `used` | 被判断为 assistant 回复实际使用的次数 |
+| `invoked` | Runtime 成功展开完整 Skill 的确定性调用次数 |
+| `inferred_used` | assistant 回复看似采用 Skill 流程的推测次数 |
 
 ### 12.3 当前计算的比例
 
 ```text
-relevance_rate = relevant / retrieved
-used_rate = used / retrieved
-used_when_relevant_rate = used / relevant
+relevance_rate = relevant / surfaced
+inferred_used_rate = inferred_used / surfaced
+inferred_used_when_relevant_rate = inferred_used / relevant
 ```
 
-这些数据由在线主链路的 usage tracking 写入，评测只读取和汇总。
+真实 invoked 由 Runtime 调用路径写入；其他数据由在线 usage tracking 写入。inferred_used 只用于诊断展示。
 
 ## 13. Status Gate
 
@@ -813,15 +815,15 @@ used_when_relevant_rate = used / relevant
 
 `Status Gate` 是把 replay、规则结果和 usage stats 合并后，给每个 Skill 打状态。
 
-状态不是单纯根据规则通过率决定的。样本数、promotion-test 数、retrieved 数、相关率、使用率都会影响状态。
+状态不是单纯根据规则通过率决定的。样本数、promotion-test 数、retrieved 数、真实 invocation 和相关率都会影响状态；inferred_used 只用于诊断展示。
 
 ### 13.2 状态含义
 
 | 状态 | 含义 |
 |------|------|
 | `unobserved` | 没有 replay，也没有 usage 信号 |
-| `incubating` | 有信号，但 replay、promotion-test 或 retrieved 数量不足 |
-| `watch` | 数据量够了，但规则、相关率或使用率低于阈值 |
+| `incubating` | 有信号，但 replay、promotion-test、retrieved 或真实 invocation 数量不足 |
+| `watch` | 数据量够了，但规则或相关率低于阈值 |
 | `healthy` | replay、规则和 usage gate 都通过 |
 | `pruned` | Skill 已被 stale pruning 归档 |
 
@@ -832,7 +834,7 @@ used_when_relevant_rate = used / relevant
 | `DEFAULT_MIN_REPLAY_SAMPLES` | `2` |
 | `DEFAULT_MIN_PROMOTION_TESTS` | `1` |
 | `DEFAULT_MIN_RETRIEVED` | `5` |
-| `DEFAULT_MIN_USED_RATE` | `0.2` |
+| `DEFAULT_MIN_INVOCATIONS` | `1` |
 | `DEFAULT_MIN_RELEVANCE_RATE` | `0.35` |
 | `DEFAULT_MIN_RULE_PASS_RATE` | `0.8` |
 
@@ -1002,8 +1004,9 @@ YYYYMMDDTHHMMSSZ-<lineage_id_suffix>
 | `reasons` | 状态原因 |
 | `source_count` / `history_count` | 在线来源统计 |
 | `current_version` | 当前版本 |
-| `retrieved` / `relevant` / `used` | usage 统计 |
-| `relevance_rate` / `used_rate` / `used_when_relevant_rate` | usage 比例 |
+| `retrieved` / `surfaced` / `invoked` | 检索、注入和确定性调用统计 |
+| `relevant` / `inferred_used` | judge 的语义推测统计 |
+| `relevance_rate` / `inferred_used_rate` | 诊断比例；后者不参与归档或晋级 |
 | `replay` | replay 数量、split、来源 |
 | `eval` | 规则、通过率、失败信息 |
 | `artifacts` | dataset、eval spec、run、champion、promotion 信息 |
@@ -1025,7 +1028,7 @@ Online skill eval:
   statuses: incubating=3, unobserved=1
   champion_statuses: incubating=3, unobserved=1
   skills:
-    <skill>: status=incubating, replay=1 (test=0), rules=2, llm_rules=1, llm_judgments=1, candidates=1, best_candidate_score=3.00, rule_pass=50.0%, hard_failures=0, retrieved=2, used_rate=50.0%, champion=incubating - only 1 replay sample(s); failures: skill_instruction_alignment: <judge reason>
+    <skill>: status=incubating, replay=1 (test=0), rules=2, llm_rules=1, llm_judgments=1, candidates=1, best_candidate_score=3.00, rule_pass=50.0%, hard_failures=0, retrieved=2, surfaced=2, invoked=0, inferred_used_rate=50.0%, champion=incubating - only 1 replay sample(s); failures: skill_instruction_alignment: <judge reason>
   report_file=/path/to/online_eval_report.json
 ```
 
@@ -1071,10 +1074,7 @@ Online skill eval:
   statuses: incubating=3, unobserved=1
   champion_statuses: incubating=3, unobserved=1
   skills:
-    政府报告撰写-正式书面化与政策结合: status=incubating, replay=1 (test=0), rules=2, llm_rules=1, llm_judgments=1, candidates=1, best_candidate_score=3.00, rule_pass=50.0%, hard_failures=0, retrieved=2, used_rate=50.0%, champion=incubating - only 1 replay sample(s); only 0 promotion-test sample(s); only 2 retrieval judgment(s); failures: skill_instruction_alignment: Response fails to deliver a ~500-word formal report as requested; it includes clarifying questions and a draft exceeding the word limit.
-    zhangxuefeng-perspective: status=incubating, replay=0 (test=0), rules=4, llm_rules=1, llm_judgments=0, candidates=0, best_candidate_score=0.00, rule_pass=0.0%, hard_failures=0, retrieved=12, used_rate=0.0%, champion=incubating - only 0 replay sample(s); only 0 promotion-test sample(s)
-    webnovel-writing: status=incubating, replay=0 (test=0), rules=2, llm_rules=1, llm_judgments=0, candidates=0, best_candidate_score=0.00, rule_pass=0.0%, hard_failures=0, retrieved=6, used_rate=0.0%, champion=incubating - only 0 replay sample(s); only 0 promotion-test sample(s)
-    code_review: status=unobserved, replay=0 (test=0), rules=2, llm_rules=1, llm_judgments=0, candidates=0, best_candidate_score=0.00, rule_pass=0.0%, hard_failures=0, retrieved=0, used_rate=0.0%, champion=unobserved - no online replay or usage signal yet
+    政府报告撰写-正式书面化与政策结合: status=incubating, replay=1 (test=0), rules=2, llm_rules=1, llm_judgments=1, candidates=1, best_candidate_score=3.00, rule_pass=50.0%, hard_failures=0, retrieved=2, surfaced=2, invoked=0, inferred_used_rate=50.0%, champion=incubating - only 1 replay sample(s); only 0 promotion-test sample(s); only 2 retrieval judgment(s); only 0 verified invocation(s)
   report_file=/Users/xiao_xiong/Desktop/code/BearCode/.bear/skill-evolution/online_eval_report.json
 ```
 
@@ -1151,7 +1151,8 @@ incubating=3, unobserved=1
 | `rule_pass=50.0%` | 当前 Skill 的规则通过率。2 条规则里通过 1 条 |
 | `hard_failures=0` | 没有硬失败规则 |
 | `retrieved=2` | 后续被检索判断过 2 次 |
-| `used_rate=50.0%` | 被检索后实际使用比例为 50% |
+| `invoked=1` | Runtime 已确认完整 Skill 被展开 1 次 |
+| `inferred_used_rate=50.0%` | 裁判推测采用率为 50%，仅供诊断 |
 | `candidates=1` | 生成并评测了 1 个候选变体 |
 | `best_candidate_score=3.00` | 当前候选变体里最高的平均分 |
 | `champion=incubating` | 本地最佳版本状态仍然是观察期 |
@@ -1216,7 +1217,7 @@ incubating=3, unobserved=1
 从当前 SKILL.md 编译 programmatic 和可选 llm_binary 规则，
 评估历史 latest_assistant 是否满足规则，
 基于失败规则生成候选变体并评测 candidate replay 回复，
-合并 retrieved / relevant / used 统计，
+合并 retrieved / surfaced / invoked / inferred_used 统计，
 根据 replay、规则、usage gate 判断状态，
 写出 report、eval spec、run artifacts、candidate artifacts 和 champion 记录。
 ```

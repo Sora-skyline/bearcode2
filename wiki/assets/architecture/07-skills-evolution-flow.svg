@@ -134,7 +134,7 @@
   </g>
   <g transform="translate(1210,1148)">
     <rect class="card orangeCard" width="270" height="58" rx="14"/>
-    <text class="small" x="26" y="37">长期 retrieved 未 used 可归档</text>
+    <text class="small" x="16" y="37">surfaced 充分且 invoked=0 才归档</text>
   </g>
   <path class="gline" d="M1530 648V1060H700V1177H820"/>
   <path class="line" d="M1805 822V1060H1370V1148"/>

@@ -98,7 +98,7 @@ async def extract_online_skill_candidate(
     *,
     messages: list[dict[str, Any]],
     side_query: SideQuery,
-    retrieved_reference: dict[str, Any] | None = None,
+    skill_trace: dict[str, Any] | None = None,
     hint: str = "",
 ) -> OnlineSkillCandidate | None:
     """让 side query 从“任务、回答、下一轮反馈”中抽取耐久且可复用的 Skill。"""
@@ -113,14 +113,14 @@ async def extract_online_skill_candidate(
         "- Do not extract assistant-only guesses, weak confirmations, one-off task payload, secrets, project facts, URLs, account IDs, exact dates, or temporary parameters.\n"
         "- Extract only durable workflow, output policy, implementation preference, correction, or repeated constraint likely useful for future similar tasks.\n"
         "- Remove entity names and runtime-specific payload; use placeholders where needed.\n"
-        "- retrieved_reference is identity context only; never treat it as new user evidence.\n"
+        "- skill_trace is identity context only; never treat retrieved, surfaced, or invoked metadata as new user evidence.\n"
         "- If evidence is weak, generic, or low-value, return {\"skills\": []}.\n"
     )
     payload = {
-        # retrieved_reference 只帮助识别“是否在改已有 Skill”，不能替代真实用户证据。
+        # Skill trace 只帮助识别“是否在改已有 Skill”，不能替代真实用户证据。
         "messages": messages,
         "hint": hint,
-        "retrieved_reference": retrieved_reference or None,
+        "skill_trace": skill_trace or None,
     }
     # 解析失败或空 skills 都按“没有可靠候选”处理，不让不稳定输出触发落盘。
     parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
@@ -157,7 +157,7 @@ async def maintain_online_skill_candidate(
     *,
     candidate: OnlineSkillCandidate,
     side_query: SideQuery,
-    retrieved_reference: dict[str, Any] | None = None,
+    skill_trace: dict[str, Any] | None = None,
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
 ) -> dict[str, Any]:
@@ -168,7 +168,14 @@ async def maintain_online_skill_candidate(
     skills = discover_skills() # 加载现有 Skills
     exact_target = _exact_identity_match(candidate, skills)# 精确身份匹配
     similar_hits = retrieve_relevant_skills(_candidate_search_text(candidate), limit=8, min_score=0.03)# 相似 Skill 检索
-    top_reference_name = str((retrieved_reference or {}).get("name") or "").strip()
+    existing_names = {str(getattr(skill, "name", "") or "").strip() for skill in skills}
+    invoked_names = []
+    for item in list((skill_trace or {}).get("invoked") or []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if name and name in existing_names and name not in invoked_names:
+            invoked_names.append(name)
 
     system = (
         "You are Bear Code's online Skill Set Manager.\n"
@@ -182,12 +189,13 @@ async def maintain_online_skill_candidate(
         "- Prefer merge over add when the same capability already exists.\n"
         "- Discard if the candidate duplicates an existing shared/project skill and adds no user-specific durable improvement.\n"
         "- If merging, synthesize a complete merged instruction body, preserving useful existing guidance and adding only durable new guidance.\n"
+        "- invoked skills are strong identity context; retrieved and surfaced skills are audit context only and cannot decide a merge target.\n"
         "- Do not preserve one-off payload, secrets, transient project facts, URLs, exact dates, or assistant-only claims.\n"
     )
     payload = {
         "candidate": asdict(candidate),
         "exact_identity_target": exact_target,
-        "retrieved_reference": retrieved_reference or None,
+        "skill_trace": skill_trace or None,
         "similar_skills": similar_hits,
         "existing_skills": [
             {
@@ -217,8 +225,19 @@ async def maintain_online_skill_candidate(
             # 高相似候选即使 LLM 建议 add，也保守合并到最高分已有 Skill。
             action = "merge"
             target_skill = str(top.get("name") or "")
-    elif action == "merge" and not target_skill:
-        target_skill = top_reference_name
+    elif action == "merge":
+        # LLM 给出的目标必须真实存在；检索 Top 1 不能作为隐式目标。
+        if target_skill not in existing_names:
+            target_skill = ""
+        if not target_skill and len(invoked_names) == 1:
+            target_skill = invoked_names[0]
+        if not target_skill and similar_hits:
+            top = similar_hits[0]
+            top_name = str(top.get("name") or "")
+            if float(top.get("score", 0.0)) >= 0.55 and top_name in existing_names:
+                target_skill = top_name
+        if not target_skill:
+            action = "discard"
 
     if action not in {"add", "merge", "discard"}:
         # 非法或缺失动作默认 discard，保证异常模型输出不会触发写文件。
@@ -239,7 +258,6 @@ async def maintain_online_skill_candidate(
         }
 
     if action == "merge":
-        target_skill = target_skill or top_reference_name
         if not target_skill:
             return {"ok": False, "action": "merge", "error": "missing target_skill", "decision": decision}
         # merge 委托持久化层保存旧快照并提升版本，不做无历史覆盖。
@@ -275,7 +293,7 @@ async def online_ingest(
     *,
     messages: list[dict[str, Any]],
     side_query: SideQuery,
-    retrieved_reference: dict[str, Any] | None = None,
+    skill_trace: dict[str, Any] | None = None,
     hint: str = "",
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
@@ -292,7 +310,7 @@ async def online_ingest(
         candidate = await extract_online_skill_candidate(
             messages=messages,
             side_query=side_query,
-            retrieved_reference=retrieved_reference,
+            skill_trace=skill_trace,
             hint=hint,
         )
     except Exception as exc:
@@ -301,7 +319,7 @@ async def online_ingest(
             action="failed",
             result=result,
             messages=messages,
-            retrieved_reference=retrieved_reference,
+            skill_trace=skill_trace,
             error=str(exc),
         )
         return result
@@ -313,7 +331,7 @@ async def online_ingest(
             action="none",
             result=result,
             messages=messages,
-            retrieved_reference=retrieved_reference,
+            skill_trace=skill_trace,
         )
         return result
 
@@ -322,7 +340,7 @@ async def online_ingest(
         result = await maintain_online_skill_candidate(
             candidate=candidate,
             side_query=side_query,
-            retrieved_reference=retrieved_reference,
+            skill_trace=skill_trace,
             confirm_write=confirm_write,
             target=target,
         )
@@ -335,44 +353,49 @@ async def online_ingest(
         skill_name=str(result.get("skill") or candidate.name),
         result=result,
         messages=messages,
-        retrieved_reference=retrieved_reference,
+        skill_trace=skill_trace,
         decision=result.get("decision") if isinstance(result.get("decision"), dict) else None,
         error="" if result.get("ok") else str(result.get("error") or ""),
     )
     return result
 
 # 让一个额外的 LLM 在回答完成后做“行为判断”。
-async def judge_retrieved_skill_usage(
+async def judge_retrieved_skill_adoption(
     *,
     hits: list[dict[str, Any]],
     user_message: str,
     assistant_text: str,
+    surfaced_names: set[str] | None = None,
+    invoked_names: set[str] | None = None,
     side_query: SideQuery | None = None,
 ) -> list[dict[str, Any]]:
-    """逐个判断检索命中是否相关、回答是否实际使用，供 usage gate 累积统计。"""
+    """逐个判断检索命中是否相关、回答是否看似采用，确定性调用由 Runtime 提供。"""
     if not hits:
         return []
+    surfaced = set(surfaced_names or set())
+    invoked = set(invoked_names or set())
     if side_query is None:
-        # 无 judge 时只能用名称是否出现在回答中的弱启发式，relevant 保守记为 False。
-        assistant_lower = assistant_text.lower()
+        # 无 judge 时不再用名称命中冒充使用证据，两个语义推测都保守记为 False。
         return [
             {
                 "name": hit.get("name", ""),
                 "source": hit.get("source", ""),
                 "skill_dir": hit.get("skill_dir", ""),
                 "retrieved": True,
+                "surfaced": str(hit.get("name") or "") in surfaced,
+                "invoked": str(hit.get("name") or "") in invoked,
                 "relevant": False,
-                "used": str(hit.get("name", "")).lower() in assistant_lower,
+                "inferred_used": False,
                 "score": float(hit.get("score", 0.0)),
-                "reason": "heuristic fallback",
+                "reason": "judge unavailable",
             }
             for hit in hits
         ]
 
     system = (
-        "Judge whether retrieved skills were relevant to the user request and actually used in the assistant reply.\n"
-        "Output ONLY strict JSON: {\"judgments\":[{\"name\":\"...\",\"relevant\":true|false,\"used\":true|false,\"reason\":\"short\"}]}.\n"
-        "A skill is used only if the reply follows its distinctive workflow or policy, not merely because it was retrieved."
+        "Judge whether retrieved skills were relevant and whether the reply appears to adopt their distinctive guidance.\n"
+        "Output ONLY strict JSON: {\"judgments\":[{\"name\":\"...\",\"relevant\":true|false,\"inferred_used\":true|false,\"reason\":\"short\"}]}.\n"
+        "inferred_used means the reply appears to follow the skill's distinctive workflow; it never proves a real invocation."
     )
     payload = {"user_message": user_message, "assistant_reply": assistant_text, "retrieved_skills": hits}
     parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
@@ -389,8 +412,10 @@ async def judge_retrieved_skill_usage(
                 "source": hit.get("source", ""),
                 "skill_dir": hit.get("skill_dir", ""),
                 "retrieved": True,
+                "surfaced": name in surfaced,
+                "invoked": name in invoked,
                 "relevant": bool(raw.get("relevant")),
-                "used": bool(raw.get("used")),
+                "inferred_used": bool(raw.get("inferred_used")),
                 "score": float(hit.get("score", 0.0)),
                 "reason": str(raw.get("reason") or ""),
             }

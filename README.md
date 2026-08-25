@@ -165,12 +165,17 @@ Bear Code 的核心特色是 **自进化 Skills**。它可以从用户明确反�
 ```env
 BEAR_AUTO_SKILL_EVOLUTION=1
 BEAR_AUTO_SKILL_TARGET=project
+# 用户级 Skill 默认 surfaced 40 次且 invoked 为 0 时归档
+BEAR_SKILL_USAGE_PRUNE_MIN_SURFACED=40
+BEAR_SKILL_USAGE_PRUNE_MAX_INVOKED=0
 ```
 
 含义：
 
 - `BEAR_AUTO_SKILL_EVOLUTION=1`：启用在线 Skill 自进化。
 - `BEAR_AUTO_SKILL_TARGET=project`：自动新增的 Skill 写入当前项目 `.bear/skills/`。
+- `BEAR_SKILL_USAGE_PRUNE_MIN_SURFACED`：自动归档前要求的摘要注入样本数。
+- `BEAR_SKILL_USAGE_PRUNE_MAX_INVOKED`：允许自动归档的最大真实调用数。
 
 如果希望沉淀为所有项目共享的个人 Skill：
 
@@ -235,11 +240,16 @@ python3 -m agents.main --yolo
   -> 合并进上一轮 window
   -> online_ingest()
   -> Extractor 抽取候选 Skill
-  -> Maintainer 判断 add / merge / discard
+  -> Maintainer 结合 skill_trace 判断 add / merge / discard
   -> create_skill_file() 或 evolve_skill_file()
   -> 写入 SKILL.md
   -> 记录 provenance、usage stats 和版本快照
 ```
+
+每轮 `skill_trace` 分开记录 `retrieved`（检索命中）、`surfaced`（摘要已注入）和
+`invoked`（完整 Skill 已真实展开）。只有 `invoked` 是确定性使用证据；检索 Top 1
+只用于提示和审计，不能直接成为 merge 目标。裁判模型输出的 `inferred_used` 仅表示
+最终回答看起来采用了某个流程，不参与自动归档或 champion 晋级。
 
 核心文件：
 

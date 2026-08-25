@@ -6,7 +6,7 @@ Skill 是可复用的方法/流程，而不是事实记忆。用户级与项目�
 
 需要区分三种动作：``retrieve_relevant_skills`` 只给模型相关摘要；``execute_skill`` 才
 展开完整方法并记录显式调用；``create/evolve_skill`` 才修改磁盘。相关性命中不等于
-模型实际采用，因此在线统计会另外记录 relevant 与 used。
+模型实际采用，因此在线统计会分别记录 surfaced、invoked 与 inferred_used。
 
 从 Harness 视角看，Skill 不是一个新的基础模型，也不一定执行代码；它主要是一段经过
 沉淀的操作说明。inline Skill 把说明加入主 Agent 上下文，fork Skill 则用独立子 Agent
@@ -60,16 +60,20 @@ def execute_skill(skill_name:str, args:object)-> dict | None:
     if not skill:
         return None
 
+    # 先完成模板展开；只有成功得到完整 prompt 才属于确定性的 invoked。
+    prompt = resolve_skill_prompt(skill, args)
     # 每次显式调用都会进入 usage.jsonl，和“对话前自动检索”统计分开记录。
     record_skill_invocation(
         skill_name=skill.name,
         source=skill.source,
         context=skill.context,
+        skill_dir=skill.skill_dir,
         args=args,
     )
 
     return {
-        "prompt": resolve_skill_prompt(skill, args),
+        "name": skill.name,
+        "prompt": prompt,
         "allowed_tools": skill.allowed_tools,
         "context": skill.context,
         "source": skill.source,
@@ -369,7 +373,7 @@ def format_retrieved_skill_context(query: str, *, limit: int = 3) -> tuple[str, 
             lines.append(f"   When to use: {hit['when_to_use']}")
     lines.append("</retrieved_skills>")
     top = dict(hits[0])
-    # top_ref 用于关联上一轮身份；all_hits 用于逐项记录 retrieved/relevant/used。
+    # top_ref 保留最高分摘要；all_hits 用于逐项记录 retrieved/surfaced 与语义判断。
     top["all_hits"] = hits
     return "\n".join(lines), top
 
@@ -448,7 +452,7 @@ def record_online_provenance(
     skill_name: str = "",
     result: dict[str, Any] | None = None,
     messages: list[dict[str, Any]] | None = None,
-    retrieved_reference: dict[str, Any] | None = None,
+    skill_trace: dict[str, Any] | None = None,
     decision: dict[str, Any] | None = None,
     error: str = "",
 ) -> None:
@@ -458,7 +462,7 @@ def record_online_provenance(
         skill_name=skill_name,
         result=result,
         messages=messages,
-        retrieved_reference=retrieved_reference,
+        skill_trace=skill_trace,
         decision=decision,
         error=error,
     )
@@ -475,7 +479,7 @@ def skill_stats() -> str:
 
 
 def record_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, Any]:
-    """写入检索 Skill 的 relevant/used 判断，并在归档发生后刷新发现缓存。"""
+    """写入检索 Skill 的 relevant/inferred_used 判断，并在归档后刷新缓存。"""
     # skills.py 只提供面向 Agent 的门面；累计计数和归档策略集中在持久化模块中。
     result = record_skill_usage_judgments(judgments)
     if result.get("pruned"):

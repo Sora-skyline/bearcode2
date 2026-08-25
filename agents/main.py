@@ -334,7 +334,7 @@ async def run_repl(agent: Agent) -> None:
                         if not result:
                             print_error(f"Unknown skill: {skill.name}")
                             continue
-                        await agent.chat(result["prompt"])
+                        await agent.chat(result["prompt"], initial_skill_invocations=[result])
                 except Exception as e:
                     if "abort" not in str(e).lower():
                         print_error(str(e))

@@ -102,11 +102,26 @@ def _compact_messages(messages: list[dict[str, Any]], *, max_messages: int = 12,
     return out
 
 
+def _compact_skill_trace(trace: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+    """压缩 provenance 中的 Skill 身份轨迹，不保存正文或调用参数。"""
+    allowed = {"name", "description", "when_to_use", "score", "source", "context", "skill_dir", "count"}
+    compact: dict[str, list[dict[str, Any]]] = {"retrieved": [], "surfaced": [], "invoked": []}
+    for kind in compact:
+        for item in list((trace or {}).get(kind) or [])[:8]:
+            if not isinstance(item, dict):
+                continue
+            compact[kind].append(
+                {key: _preview(value, 1200) if isinstance(value, str) else value for key, value in item.items() if key in allowed}
+            )
+    return compact
+
+
 def record_skill_invocation(
     *,
     skill_name: str,
     source: str,
     context: str,
+    skill_dir: str = "",
     args: object = "",
 ) -> None:
     """追加一次显式 Skill 调用事件，用于生命周期统计。"""
@@ -117,9 +132,19 @@ def record_skill_invocation(
         "skill": skill_name,
         "source": source,
         "context": context,
+        "skill_dir": skill_dir,
         "args_preview": _preview(args),
     }
     _append_jsonl(get_evolution_dir() / USAGE_LOG, row)
+    stats_path = get_evolution_dir() / SKILL_USAGE_STATS
+    stats = _read_json(stats_path, {})
+    if not isinstance(stats, dict):
+        stats = {}
+    item = _usage_stats_item(stats, skill_name, source=source, skill_dir=skill_dir)
+    item["invoked"] = _invocation_counts().get(skill_name, 0)
+    item["last_invoked"] = row["time"]
+    _write_json(stats_path, stats)
+    _sync_usage_into_provenance(stats)
 
 
 def record_skill_feedback(
@@ -146,7 +171,7 @@ def record_online_skill_provenance(
     skill_name: str = "",
     result: dict[str, Any] | None = None,
     messages: list[dict[str, Any]] | None = None,
-    retrieved_reference: dict[str, Any] | None = None,
+    skill_trace: dict[str, Any] | None = None,
     decision: dict[str, Any] | None = None,
     error: str = "",
 ) -> None:
@@ -160,7 +185,7 @@ def record_online_skill_provenance(
         "ok": bool((result or {}).get("ok")) if result is not None else not bool(error),
         "result": result or {},
         "messages": _compact_messages(list(messages or [])),
-        "retrieved_reference": retrieved_reference or {},
+        "skill_trace": _compact_skill_trace(skill_trace),
         "decision": decision or {},
         "error": _preview(error, 1200),
     }
@@ -199,7 +224,7 @@ def _update_online_provenance_index(row: dict[str, Any]) -> None:
         "action": row.get("action"),
         "ok": row.get("ok"),
         "messages": row.get("messages", []),
-        "retrieved_reference": row.get("retrieved_reference", {}),
+        "skill_trace": row.get("skill_trace", {}),
         "decision": row.get("decision", {}),
         "error": row.get("error", ""),
     }
@@ -483,12 +508,66 @@ def evolve_skill_file(
     return {"ok": True, **event}
 
 
+def _usage_stats_item(
+    stats: dict[str, Any],
+    skill: str,
+    *,
+    source: str = "",
+    skill_dir: str = "",
+) -> dict[str, Any]:
+    """返回新证据模型下的 Skill 累计项；不读取或迁移旧 used 字段。"""
+    item = stats.setdefault(
+        skill,
+        {
+            "retrieved": 0,
+            "surfaced": 0,
+            "relevant": 0,
+            "invoked": 0,
+            "inferred_used": 0,
+            "last_retrieved": "",
+            "last_surfaced": "",
+            "last_relevant": "",
+            "last_invoked": "",
+            "last_inferred_used": "",
+            "source": source,
+            "skill_dir": skill_dir,
+        },
+    )
+    if source:
+        item["source"] = source
+    if skill_dir:
+        item["skill_dir"] = skill_dir
+    return item
+
+
+def _invocation_counts() -> dict[str, int]:
+    """从 append-only invocation 事件重建真实调用计数。"""
+    counts: dict[str, int] = {}
+    path = get_evolution_dir() / USAGE_LOG
+    if not path.is_file():
+        return counts
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get("event") != "invoke":
+            continue
+        skill = str(row.get("skill") or "").strip()
+        if skill:
+            counts[skill] = int(counts.get(skill, 0)) + 1
+    return counts
+
+
 def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, Any]:
-    """累计 retrieved/relevant/used 统计，并检查长期无效 Skill 是否需要归档。"""
+    """累计 retrieved/surfaced 与语义推测；invoked 只来自真实调用日志。"""
     # 统计按项目隔离保存在 .bear/skill-evolution/skill_usage_stats.json。
     stats_path = get_evolution_dir() / SKILL_USAGE_STATS
     # 文件不存在或内容不可用时从空字典开始；已有统计则在原计数上继续累加。
     stats = _read_json(stats_path, {})
+    if not isinstance(stats, dict):
+        stats = {}
+    invocation_counts = _invocation_counts()
     pruned: list[str] = []
     for judgment in judgments:
         # 同时兼容裁判输出的 name 和历史调用方使用的 skill 字段。
@@ -496,30 +575,28 @@ def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, A
         if not skill:
             continue
         # 第一次观察该 Skill 时建立累计结构；以后 setdefault 会保留已有计数。
-        item = stats.setdefault(
+        item = _usage_stats_item(
+            stats,
             skill,
-            {
-                "retrieved": 0,
-                "relevant": 0,
-                "used": 0,
-                "last_retrieved": "",
-                "last_used": "",
-                "source": judgment.get("source", ""),
-                "skill_dir": judgment.get("skill_dir", ""),
-            },
+            source=str(judgment.get("source") or ""),
+            skill_dir=str(judgment.get("skill_dir") or ""),
         )
-        # retrieved 每次都累加；relevant 和 used 只在 judge 对应布尔值为真时累加。
-        item["retrieved"] = int(item.get("retrieved", 0)) + 1
-        item["last_retrieved"] = _utc_now()
-        item["source"] = judgment.get("source", item.get("source", ""))
-        item["skill_dir"] = judgment.get("skill_dir", item.get("skill_dir", ""))
+        now = _utc_now()
+        if judgment.get("retrieved"):
+            item["retrieved"] = int(item.get("retrieved", 0)) + 1
+            item["last_retrieved"] = now
+        if judgment.get("surfaced"):
+            item["surfaced"] = int(item.get("surfaced", 0)) + 1
+            item["last_surfaced"] = now
+        # 真实调用数从 invocation 事件重建，不能由事后 judge 增加。
+        item["invoked"] = int(invocation_counts.get(skill, 0))
         # relevant 表示 Skill 适合本次用户请求，与最终回答是否采用它是两个维度。
         if judgment.get("relevant"):
             item["relevant"] = int(item.get("relevant", 0)) + 1
-        # used 是裁判根据最终回答推断的行为信号；真实显式调用由 usage.jsonl 另行记录。
-        if judgment.get("used"):
-            item["used"] = int(item.get("used", 0)) + 1
-            item["last_used"] = _utc_now()
+            item["last_relevant"] = now
+        if judgment.get("inferred_used"):
+            item["inferred_used"] = int(item.get("inferred_used", 0)) + 1
+            item["last_inferred_used"] = now
         # 保留最近一次裁判理由和本轮检索分数，便于人工审计误判或检索质量。
         item["last_reason"] = _preview(judgment.get("reason", ""), 500)
         item["last_score"] = judgment.get("score", 0)
@@ -534,17 +611,17 @@ def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, A
 
 def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
     """证据量达到环境阈值且长期未使用时，将 Skill 移入可审计归档目录。"""
-    # 默认需至少被检索 40 次且 used 不超过 0 次；环境变量可调整这两个门槛。
-    min_retrieved = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MIN_RETRIEVED"), 40)
-    max_used = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MAX_USED"), 0)
+    # 只有真实 invoked 属于生命周期证据；LLM 推测的 inferred_used 不参与自动归档。
+    min_surfaced = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MIN_SURFACED"), 40)
+    max_invoked = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MAX_INVOKED"), 0)
     source = str(stats.get("source") or "").strip().lower()
     # 默认只自动归档用户级 Skill；项目级必须显式开启环境变量。
     if source != "user" and os.environ.get("BEAR_SKILL_PRUNE_PROJECT", "").strip().lower() not in {"1", "true", "yes", "on"}:
         return False
-    # 样本不足时不下结论；只要 used 高于允许上限，也不能视为长期无效。
-    if int(stats.get("retrieved", 0)) < min_retrieved:
+    # 样本不足时不下结论；只要真实调用高于允许上限，也不能视为长期无效。
+    if int(stats.get("surfaced", 0)) < min_surfaced:
         return False
-    if int(stats.get("used", 0)) > max_used:
+    if int(stats.get("invoked", 0)) > max_invoked:
         return False
     skill_dir = Path(str(stats.get("skill_dir") or ""))
     # 只移动仍然存在的普通 Skill 目录；缺失路径和隐藏目录都拒绝处理。
@@ -568,7 +645,9 @@ def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
         "from": str(skill_dir),
         "to": str(destination),
         "retrieved": stats.get("retrieved", 0),
-        "used": stats.get("used", 0),
+        "surfaced": stats.get("surfaced", 0),
+        "invoked": stats.get("invoked", 0),
+        "inferred_used": stats.get("inferred_used", 0),
     }
     _append_jsonl(get_evolution_dir() / USAGE_LOG, event)
     stats["pruned"] = True
@@ -604,14 +683,14 @@ def load_skill_stats() -> dict[str, dict[str, Any]]:
             skill = str(row.get("skill") or "").strip()
             if not skill:
                 continue
-            item = stats.setdefault(skill, {"created": 0, "invocations": 0, "feedback": 0, "evolutions": 0})
+            item = stats.setdefault(skill, {"created": 0, "invoked": 0, "feedback": 0, "evolutions": 0})
             event = row.get("event")
             if event == "create":
                 item["created"] = int(item.get("created", 0)) + 1
                 item["created_at"] = row.get("time")
                 item["file"] = row.get("file")
             elif event == "invoke":
-                item["invocations"] = int(item.get("invocations", 0)) + 1
+                item["invoked"] = int(item.get("invoked", 0)) + 1
                 item["last_invoked"] = row.get("time")
             elif event == "feedback":
                 item["feedback"] = int(item.get("feedback", 0)) + 1
@@ -627,19 +706,22 @@ def load_skill_stats() -> dict[str, dict[str, Any]]:
         for path in history_root.glob("*.jsonl"):
             count = len([line for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()])
             skill = path.stem
-            item = stats.setdefault(skill, {"created": 0, "invocations": 0, "feedback": 0, "evolutions": 0})
+            item = stats.setdefault(skill, {"created": 0, "invoked": 0, "feedback": 0, "evolutions": 0})
             item["snapshots"] = count
     usage_stats = _read_json(get_evolution_dir() / SKILL_USAGE_STATS, {})
     if isinstance(usage_stats, dict):
         for skill, usage in usage_stats.items():
             if not isinstance(usage, dict):
                 continue
-            item = stats.setdefault(str(skill), {"created": 0, "invocations": 0, "feedback": 0, "evolutions": 0})
+            item = stats.setdefault(str(skill), {"created": 0, "invoked": 0, "feedback": 0, "evolutions": 0})
             item["retrieved"] = usage.get("retrieved", 0)
+            item["surfaced"] = usage.get("surfaced", 0)
             item["relevant"] = usage.get("relevant", 0)
-            item["used"] = usage.get("used", 0)
+            item["invoked"] = max(int(item.get("invoked", 0)), int(usage.get("invoked", 0) or 0))
+            item["inferred_used"] = usage.get("inferred_used", 0)
             item["last_retrieved"] = usage.get("last_retrieved", "")
-            item["last_used"] = usage.get("last_used", "")
+            item["last_surfaced"] = usage.get("last_surfaced", "")
+            item["last_inferred_used"] = usage.get("last_inferred_used", "")
             item["pruned"] = usage.get("pruned", False)
     return stats
 
@@ -655,12 +737,13 @@ def format_skill_stats() -> str:
         item = stats[name]
         parts = [
             f"created={item.get('created', 0)}",
-            f"invoked={item.get('invocations', 0)}",
+            f"invoked={item.get('invoked', 0)}",
             f"feedback={item.get('feedback', 0)}",
             f"evolved={item.get('evolutions', 0)}",
             f"snapshots={item.get('snapshots', 0)}",
             f"retrieved={item.get('retrieved', 0)}",
-            f"used={item.get('used', 0)}",
+            f"surfaced={item.get('surfaced', 0)}",
+            f"inferred_used={item.get('inferred_used', 0)}",
         ]
         if item.get("created_at"):
             parts.append(f"created_at={item['created_at']}")
@@ -668,8 +751,8 @@ def format_skill_stats() -> str:
             parts.append(f"version={item['version']}")
         if item.get("last_invoked"):
             parts.append(f"last_invoked={item['last_invoked']}")
-        if item.get("last_used"):
-            parts.append(f"last_used={item['last_used']}")
+        if item.get("last_inferred_used"):
+            parts.append(f"last_inferred_used={item['last_inferred_used']}")
         if item.get("pruned"):
             parts.append("pruned=true")
         lines.append(f"  {name}: " + ", ".join(parts))

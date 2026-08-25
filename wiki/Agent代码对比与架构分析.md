@@ -331,8 +331,8 @@ skill_evolution.py 负责：
 - 更新版本号并保存历史快照；
 - 写 usage.jsonl 和 online_provenance.jsonl；
 - 维护 online_skill_provenance.json；
-- 汇总 relevant、used、retrieved 统计；
-- 对长期未命中的 Skill 做 stale pruning。
+- 汇总 retrieved、surfaced、relevant、invoked、inferred_used 统计；
+- 对展示样本充分但没有真实调用的 Skill 做 stale pruning。
 
 ### 8.4 在线评测
 

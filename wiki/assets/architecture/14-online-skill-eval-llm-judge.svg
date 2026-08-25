@@ -37,7 +37,7 @@
   <text class="small" x="578" y="526">按 Skill 聚合来源</text>
   <rect class="card orangeCard" x="540" y="590" width="300" height="105" rx="18"/>
   <text class="label" x="584" y="632">usage_stats</text>
-  <text class="small" x="570" y="666">retrieved / relevant / used</text>
+  <text class="small" x="552" y="666">retrieved / surfaced / invoked</text>
   <rect class="card purpleCard" x="540" y="730" width="300" height="105" rx="18"/>
   <text class="label" x="600" y="772">Active Skills</text>
   <text class="small" x="574" y="806">当前 SKILL.md 快照</text>

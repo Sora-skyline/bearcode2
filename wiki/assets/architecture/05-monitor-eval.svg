@@ -4,7 +4,7 @@
   <text class="title" x="650" y="90">自进化审计闭环</text>
   <rect class="panel shadow" x="90" y="160" width="1740" height="920" rx="24"/>
   <g transform="translate(170,260)"><rect class="card blueCard" width="300" height="160" rx="20"/><text class="label" x="86" y="58">Skill 召回</text><text class="small" x="70" y="102">retrieved hit</text></g>
-  <g transform="translate(600,260)"><rect class="card greenCard" width="300" height="160" rx="20"/><text class="label" x="86" y="58">Usage Judge</text><text class="small" x="54" y="102">relevant / used</text></g>
+  <g transform="translate(600,260)"><rect class="card greenCard" width="300" height="160" rx="20"/><text class="label" x="86" y="58">Usage Judge</text><text class="small" x="28" y="102">relevant / inferred_used</text></g>
   <g transform="translate(1030,260)"><rect class="card orangeCard" width="300" height="160" rx="20"/><text class="label" x="78" y="58">使用统计</text><text class="small" x="40" y="102">skill_usage_stats.json</text></g>
   <g transform="translate(1460,260)"><rect class="card redCard" width="300" height="160" rx="20"/><text class="label" x="78" y="58">Stale 归档</text><text class="small" x="68" y="102">pruned/</text></g>
   <g transform="translate(390,600)"><rect class="card greenCard" width="320" height="170" rx="20"/><text class="label" x="92" y="60">在线沉淀</text><text class="small" x="62" y="104">online_ingest()</text></g>
@@ -14,4 +14,3 @@
   <path class="line" d="M470 340H600"/><path class="line" d="M900 340H1030"/><path class="line" d="M1330 340H1460"/><path class="line" d="M710 685H800"/><path class="line" d="M1120 685H1210"/><path class="line" d="M1370 770V900H1160"/><path class="line" d="M960 770V860"/>
   <text class="section" x="575" y="1040">自进化能力必须可观察、可解释、可回溯</text>
 </svg>
-

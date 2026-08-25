@@ -1,7 +1,7 @@
 """面向自动 Skill 演化的在线验收与候选试跑。
 
 评测以真实 provenance 构造 replay，从当前 active Skill 编译程序规则和可选 LLM judge
-规则，再结合 retrieved/relevant/used 信号判定 lineage 状态。失败规则可以产生候选变体，
+规则，再结合 retrieved/surfaced/invoked/inferred_used 信号判定 lineage 状态。失败规则可以产生候选变体，
 但 champion 仅是本地最佳记录，不会覆盖 active SKILL.md。
 
 评测流水线可按五段阅读：加载在线证据 -> 冻结 replay 并稳定划分 dev/test -> 从 Skill
@@ -30,7 +30,7 @@ from .skill_evolution import (
 DEFAULT_MIN_REPLAY_SAMPLES = 2
 DEFAULT_MIN_PROMOTION_TESTS = 1
 DEFAULT_MIN_RETRIEVED = 5
-DEFAULT_MIN_USED_RATE = 0.2
+DEFAULT_MIN_INVOCATIONS = 1
 DEFAULT_MIN_RELEVANCE_RATE = 0.35
 DEFAULT_MIN_RULE_PASS_RATE = 0.8
 DEFAULT_DEV_SPLIT_RATIO = 0.75
@@ -1129,14 +1129,15 @@ def _skill_status(
     replay_count: int,
     promotion_test_count: int,
     retrieved: int,
+    surfaced: int,
     relevant: int,
-    used: int,
+    invoked: int,
     pruned: bool,
     rule_summary: dict[str, Any],
     min_replay_samples: int,
     min_promotion_tests: int,
     min_retrieved: int,
-    min_used_rate: float,
+    min_invocations: int,
     min_relevance_rate: float,
     min_rule_pass_rate: float,
 ) -> tuple[str, list[str]]:
@@ -1145,7 +1146,7 @@ def _skill_status(
     if pruned:
         # 已归档是终态，优先于所有质量和样本判断。
         return "pruned", ["skill has been archived by usage pruning"]
-    if replay_count <= 0 and retrieved <= 0:
+    if replay_count <= 0 and surfaced <= 0 and invoked <= 0:
         return "unobserved", ["no online replay or usage signal yet"]
     if replay_count < min_replay_samples:
         reasons.append(f"only {replay_count} replay sample(s)")
@@ -1153,12 +1154,13 @@ def _skill_status(
         reasons.append(f"only {promotion_test_count} promotion-test sample(s)")
     if retrieved < min_retrieved:
         reasons.append(f"only {retrieved} retrieval judgment(s)")
+    if invoked < min_invocations:
+        reasons.append(f"only {invoked} verified invocation(s)")
     if reasons:
         # 证据量不足先进入观察期，不让少量偶然通过的样本直接成为 healthy。
         return "incubating", reasons
 
-    relevance_rate = _ratio(relevant, retrieved)
-    used_rate = _ratio(used, retrieved)
+    relevance_rate = _ratio(relevant, surfaced)
     pass_rate = float(rule_summary.get("pass_rate", 0.0) or 0.0)
     test_hard_failures = int(rule_summary.get("promotion_test_hard_failures", 0) or 0)
     hard_failures = int(rule_summary.get("hard_failures", 0) or 0)
@@ -1171,8 +1173,6 @@ def _skill_status(
         reasons.append(f"low replay rule pass rate {_pct(pass_rate)}")
     if relevance_rate < min_relevance_rate:
         reasons.append(f"low relevance rate {_pct(relevance_rate)}")
-    if used_rate < min_used_rate:
-        reasons.append(f"low used rate {_pct(used_rate)}")
     if reasons:
         # 证据足够但任一质量/使用门槛失败时进入 watch，等待后续改进或更多信号。
         return "watch", reasons
@@ -1487,7 +1487,7 @@ async def _evaluate_online_skill_evolution_core(
     min_replay_samples: int = DEFAULT_MIN_REPLAY_SAMPLES,
     min_promotion_tests: int = DEFAULT_MIN_PROMOTION_TESTS,
     min_retrieved: int = DEFAULT_MIN_RETRIEVED,
-    min_used_rate: float = DEFAULT_MIN_USED_RATE,
+    min_invocations: int = DEFAULT_MIN_INVOCATIONS,
     min_relevance_rate: float = DEFAULT_MIN_RELEVANCE_RATE,
     min_rule_pass_rate: float = DEFAULT_MIN_RULE_PASS_RATE,
     write_report: bool = True,
@@ -1572,8 +1572,13 @@ async def _evaluate_online_skill_evolution_core(
         # 完整 outcomes 只写 run artifact，顶层报告保留摘要以控制文件体积。
         public_rule_summary.pop("outcomes", None)
         retrieved = int(usage.get("retrieved", lifecycle.get("retrieved", 0)) or 0)
+        surfaced = int(usage.get("surfaced", lifecycle.get("surfaced", 0)) or 0)
         relevant = int(usage.get("relevant", lifecycle.get("relevant", 0)) or 0)
-        used = int(usage.get("used", lifecycle.get("used", 0)) or 0)
+        invoked = max(
+            int(usage.get("invoked", 0) or 0),
+            int(lifecycle.get("invoked", 0) or 0),
+        )
+        inferred_used = int(usage.get("inferred_used", lifecycle.get("inferred_used", 0)) or 0)
         pruned = bool(usage.get("pruned") or lifecycle.get("pruned"))
         promotion_test_count = sum(1 for item in replay_pool if item.get("split") == "promotion_test")
         # 状态门控同时要求证据量、规则通过率、相关率、使用率和零硬失败。
@@ -1581,14 +1586,15 @@ async def _evaluate_online_skill_evolution_core(
             replay_count=len(replay_pool),
             promotion_test_count=promotion_test_count,
             retrieved=retrieved,
+            surfaced=surfaced,
             relevant=relevant,
-            used=used,
+            invoked=invoked,
             pruned=pruned,
             rule_summary=rule_summary,
             min_replay_samples=min_replay_samples,
             min_promotion_tests=min_promotion_tests,
             min_retrieved=min_retrieved,
-            min_used_rate=min_used_rate,
+            min_invocations=min_invocations,
             min_relevance_rate=min_relevance_rate,
             min_rule_pass_rate=min_rule_pass_rate,
         )
@@ -1633,14 +1639,15 @@ async def _evaluate_online_skill_evolution_core(
                 "current_version": current_version,
                 "created": int(lifecycle.get("created", 0) or 0),
                 "evolutions": int(lifecycle.get("evolutions", 0) or 0),
-                "invocations": int(lifecycle.get("invocations", 0) or 0),
+                "invoked": invoked,
                 "feedback": int(lifecycle.get("feedback", 0) or 0),
                 "retrieved": retrieved,
+                "surfaced": surfaced,
                 "relevant": relevant,
-                "used": used,
-                "relevance_rate": _ratio(relevant, retrieved),
-                "used_rate": _ratio(used, retrieved),
-                "used_when_relevant_rate": _ratio(used, relevant),
+                "inferred_used": inferred_used,
+                "relevance_rate": _ratio(relevant, surfaced),
+                "inferred_used_rate": _ratio(inferred_used, surfaced),
+                "inferred_used_when_relevant_rate": _ratio(inferred_used, relevant),
                 "replay": {
                     "count": len(replay_pool),
                     "mutate_dev": sum(1 for item in replay_pool if item.get("split") == "mutate_dev"),
@@ -1709,7 +1716,7 @@ async def _evaluate_online_skill_evolution_core(
             "min_replay_samples": min_replay_samples,
             "min_promotion_tests": min_promotion_tests,
             "min_retrieved": min_retrieved,
-            "min_used_rate": min_used_rate,
+            "min_invocations": min_invocations,
             "min_relevance_rate": min_relevance_rate,
             "min_rule_pass_rate": min_rule_pass_rate,
         },
@@ -1749,7 +1756,7 @@ def evaluate_online_skill_evolution(
     min_replay_samples: int = DEFAULT_MIN_REPLAY_SAMPLES,
     min_promotion_tests: int = DEFAULT_MIN_PROMOTION_TESTS,
     min_retrieved: int = DEFAULT_MIN_RETRIEVED,
-    min_used_rate: float = DEFAULT_MIN_USED_RATE,
+    min_invocations: int = DEFAULT_MIN_INVOCATIONS,
     min_relevance_rate: float = DEFAULT_MIN_RELEVANCE_RATE,
     min_rule_pass_rate: float = DEFAULT_MIN_RULE_PASS_RATE,
     write_report: bool = True,
@@ -1763,7 +1770,7 @@ def evaluate_online_skill_evolution(
             min_replay_samples=min_replay_samples,
             min_promotion_tests=min_promotion_tests,
             min_retrieved=min_retrieved,
-            min_used_rate=min_used_rate,
+            min_invocations=min_invocations,
             min_relevance_rate=min_relevance_rate,
             min_rule_pass_rate=min_rule_pass_rate,
             write_report=write_report,
@@ -1780,7 +1787,7 @@ async def evaluate_online_skill_evolution_async(
     min_replay_samples: int = DEFAULT_MIN_REPLAY_SAMPLES,
     min_promotion_tests: int = DEFAULT_MIN_PROMOTION_TESTS,
     min_retrieved: int = DEFAULT_MIN_RETRIEVED,
-    min_used_rate: float = DEFAULT_MIN_USED_RATE,
+    min_invocations: int = DEFAULT_MIN_INVOCATIONS,
     min_relevance_rate: float = DEFAULT_MIN_RELEVANCE_RATE,
     min_rule_pass_rate: float = DEFAULT_MIN_RULE_PASS_RATE,
     write_report: bool = True,
@@ -1791,7 +1798,7 @@ async def evaluate_online_skill_evolution_async(
         min_replay_samples=min_replay_samples,
         min_promotion_tests=min_promotion_tests,
         min_retrieved=min_retrieved,
-        min_used_rate=min_used_rate,
+        min_invocations=min_invocations,
         min_relevance_rate=min_relevance_rate,
         min_rule_pass_rate=min_rule_pass_rate,
         write_report=write_report,
@@ -1906,7 +1913,9 @@ def format_online_skill_eval(report: dict[str, Any] | None = None) -> str:
                 f"rule_pass={_pct(float(eval_data.get('pass_rate', 0) or 0))}, "
                 f"hard_failures={eval_data.get('hard_failures', 0)}, "
                 f"retrieved={item.get('retrieved', 0)}, "
-                f"used_rate={_pct(float(item.get('used_rate', 0) or 0))}, "
+                f"surfaced={item.get('surfaced', 0)}, "
+                f"invoked={item.get('invoked', 0)}, "
+                f"inferred_used_rate={_pct(float(item.get('inferred_used_rate', 0) or 0))}, "
                 f"champion={promotion.get('status', 'n/a')}"
                 f"{suffix}"
             )

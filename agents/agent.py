@@ -250,8 +250,9 @@ class Agent:
         self._anthropic_messages: list[str] = []
         self._openai_messages: list[str] = []
         # ── 在线 Skill：保留本轮检索证据，并等待下一轮用户反馈补全抽取窗口 ──
-        self._last_retrieved_skill_reference: dict[str, Any] | None = None
         self._last_retrieved_skill_hits: list[dict[str, Any]] = []
+        self._last_surfaced_skill_hits: list[dict[str, Any]] = []
+        self._turn_invoked_skills: dict[str, dict[str, Any]] = {}
         self._pending_skill_extraction_window: dict[str, Any] | None = None
         self._background_skill_tasks: set[asyncio.Task] = set()
         # ── Session Memory：它服务于当前任务续跑，不等同于跨会话长期 Memory ──
@@ -457,7 +458,12 @@ class Agent:
 
     #主入口
 
-    async def  chat(self, user_message:str)->None:
+    async def chat(
+        self,
+        user_message: str,
+        *,
+        initial_skill_invocations: list[dict[str, Any]] | None = None,
+    ) -> None:
         """执行一轮完整对话，并在主回复后调度 Skill 反馈与演化任务。
 
         original_user_message 始终保留纯用户输入；实际发给模型的 user_message 可能
@@ -481,13 +487,12 @@ class Agent:
         # 阶段 2：保留纯用户输入用于审计，同时给实际模型输入追加相关 Skill 摘要。
         original_user_message = _safe_utf8_text(user_message)
         ready_skill_extraction_window: dict[str, Any] | None = None
-        self._last_retrieved_skill_reference = None
-        self._last_retrieved_skill_hits = []
+        self._start_skill_trace(initial_skill_invocations)
         if not self.is_sub_agent:
             ready_skill_extraction_window = self._pop_pending_skill_extraction_window(original_user_message)
-            user_message, self._last_retrieved_skill_reference = self._augment_user_message_with_skill_context(
-                original_user_message
-            )
+            user_message, retrieved_hits, surfaced_hits = self._augment_user_message_with_skill_context(original_user_message)
+            self._last_retrieved_skill_hits = retrieved_hits
+            self._last_surfaced_skill_hits = surfaced_hits
 
         # 阶段 3：选择协议循环。两条循环语义相同，但消息/tool result 格式不同。
         # create_task 让 abort() 可以持有并取消整条 Agent 执行链，而不只是停止终端输出。
@@ -510,18 +515,27 @@ class Agent:
         self._turn_output_buffer = None
         # 子 Agent 不负责全局 Skill 学习；被用户中止的回复也不应作为有效样本。
         if not self.is_sub_agent and not self._aborted:
+            skill_trace = self._skill_trace_snapshot()
             # 把任务丢进后台异步执行，不阻塞主对话响应, 后台判断本轮自动检索出的 Skill 是否相关、是否真正被模型采用。
-            self._schedule_background_skill_task(self._run_skill_usage_tracking(original_user_message, assistant_text))
+            self._schedule_background_skill_task(
+                self._run_skill_usage_tracking(
+                    original_user_message,
+                    assistant_text,
+                    retrieved_hits=[dict(hit) for hit in skill_trace["retrieved"]],
+                    surfaced_names={str(hit.get("name") or "") for hit in skill_trace["surfaced"]},
+                    invoked_names={str(item.get("name") or "") for item in skill_trace["invoked"]},
+                )
+            )
             # ready_skill_extraction_window 属于上一轮：当前用户输入已经作为对上一轮结果的
             # 反馈补入窗口，因此现在可以异步提炼或演化可复用的 Skill。
             if ready_skill_extraction_window:
                 self._schedule_background_skill_task(self._run_online_skill_evolution(ready_skill_extraction_window))
-            # 暂存当前问答以及本轮最高分 Skill 引用；等下一条用户消息到来后，
+            # 暂存当前问答以及本轮 Skill 证据轨迹；等下一条用户消息到来后，
             # 再把那条消息视为结果反馈，组成下一次在线演化的完整证据窗口。
             self._set_pending_skill_extraction_window(
                 original_user_message=original_user_message,
                 assistant_text=assistant_text,
-                retrieved_reference=self._last_retrieved_skill_reference,
+                skill_trace=skill_trace,
             )
         # 只有主 Agent 负责终端轮次分隔和会话持久化，避免子 Agent 污染主界面与存档。
         if not self.is_sub_agent:
@@ -619,19 +633,54 @@ class Agent:
             return True
         return False
 
-    def _augment_user_message_with_skill_context(self, user_message: str) -> tuple[str, dict[str, Any] | None]:
-        """检索最多三个相关 Skill，将摘要注入输入并保留命中证据。"""
+    def _augment_user_message_with_skill_context(
+        self,
+        user_message: str,
+    ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+        """检索最多三个相关 Skill，并分别返回 retrieved 与实际 surfaced 快照。"""
         try:
             from .skills import format_retrieved_skill_context
 
             context, top_ref = format_retrieved_skill_context(user_message, limit=3)
         except Exception:
-            return user_message, None
-        if top_ref and isinstance(top_ref.get("all_hits"), list):
-            self._last_retrieved_skill_hits = list(top_ref.get("all_hits") or [])
+            return user_message, [], []
+        hits = [dict(hit) for hit in list((top_ref or {}).get("all_hits") or []) if isinstance(hit, dict)]
         if not context.strip():
-            return user_message, top_ref
-        return f"{user_message}\n\n{context}", top_ref
+            return user_message, hits, []
+        return f"{user_message}\n\n{context}", hits, [dict(hit) for hit in hits]
+
+    def _record_turn_skill_invocation(self, invocation: dict[str, Any]) -> None:
+        """把一次已成功展开的 Skill 调用聚合进当前用户轮次。"""
+        name = str(invocation.get("name") or invocation.get("skill") or "").strip()
+        if not name:
+            return
+        current = self._turn_invoked_skills.get(name)
+        if current:
+            current["count"] = int(current.get("count", 1)) + 1
+            return
+        self._turn_invoked_skills[name] = {
+            "name": name,
+            "source": str(invocation.get("source") or ""),
+            "context": str(invocation.get("context") or "inline"),
+            "skill_dir": str(invocation.get("skill_dir") or ""),
+            "count": 1,
+        }
+
+    def _start_skill_trace(self, initial_skill_invocations: list[dict[str, Any]] | None = None) -> None:
+        """开始新的用户轮次，并登记 CLI 已在轮前展开的 inline Skill。"""
+        self._last_retrieved_skill_hits = []
+        self._last_surfaced_skill_hits = []
+        self._turn_invoked_skills = {}
+        for invocation in list(initial_skill_invocations or []):
+            self._record_turn_skill_invocation(invocation)
+
+    def _skill_trace_snapshot(self) -> dict[str, list[dict[str, Any]]]:
+        """冻结当前轮 Skill 证据，避免后台任务读取下一轮覆盖后的可变字段。"""
+        return {
+            "retrieved": [dict(hit) for hit in self._last_retrieved_skill_hits],
+            "surfaced": [dict(hit) for hit in self._last_surfaced_skill_hits],
+            "invoked": [dict(item) for item in self._turn_invoked_skills.values()],
+        }
 
     def _strip_runtime_injections(self, text: str) -> str:
         """移除 Runtime 添加的 Skill 上下文，避免其被误当作用户反馈学习。"""
@@ -732,7 +781,7 @@ class Agent:
         *,
         original_user_message: str,
         assistant_text: str,
-        retrieved_reference: dict[str, Any] | None,
+        skill_trace: dict[str, list[dict[str, Any]]],
     ) -> None:
         """暂存本轮问答，下一轮用户消息将作为结果反馈补入该窗口。"""
         if not original_user_message.strip() or not assistant_text.strip():
@@ -741,14 +790,19 @@ class Agent:
             "messages": self._recent_dialog_messages(max_messages=8),
             "latest_user": original_user_message,
             "latest_assistant": assistant_text,
-            "retrieved_reference": self._compact_retrieved_reference(retrieved_reference),
+            "skill_trace": self._compact_skill_trace(skill_trace),
             "session_id": self.session_id,
         }
 
-    def _compact_retrieved_reference(self, ref: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not ref:
-            return None
-        return {k: v for k, v in ref.items() if k != "all_hits"}
+    def _compact_skill_trace(self, trace: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+        """只保留在线演化识别 Skill 所需的非正文元数据。"""
+        allowed = {"name", "description", "when_to_use", "score", "source", "context", "skill_dir", "count"}
+        compact: dict[str, list[dict[str, Any]]] = {"retrieved": [], "surfaced": [], "invoked": []}
+        for kind in compact:
+            for item in list((trace or {}).get(kind) or []):
+                if isinstance(item, dict):
+                    compact[kind].append({key: value for key, value in item.items() if key in allowed})
+        return compact
 
     async def _run_online_skill_evolution(self, window: dict[str, Any], *, interactive_confirm: bool = False) -> None:
         """把完整反馈窗口交给 Extractor/Maintainer，并在写入后刷新能力快照。"""
@@ -770,7 +824,7 @@ class Agent:
         result = await online_ingest(
             messages=messages, # 「问题 + agent 回答 + 用户反馈」
             side_query=side_query,
-            retrieved_reference=window.get("retrieved_reference") or None,
+            skill_trace=window.get("skill_trace") or None,
             hint=str(window.get("hint") or ""),
             confirm_write=self._confirm_online_skill_write if interactive_confirm else self._confirm_background_online_skill_write,
             target=os.environ.get("BEAR_AUTO_SKILL_TARGET", "project"),
@@ -782,18 +836,25 @@ class Agent:
         elif result.get("action") not in {"add_denied", "merge_denied"}:
             print_error(f"Online skill evolution failed: {result.get('error') or result}")
 
-    async def _run_skill_usage_tracking(self, original_user_message: str, assistant_text: str) -> None:
+    async def _run_skill_usage_tracking(
+        self,
+        original_user_message: str,
+        assistant_text: str,
+        *,
+        retrieved_hits: list[dict[str, Any]],
+        surfaced_names: set[str],
+        invoked_names: set[str],
+    ) -> None:
         """让独立裁判模型评估检索命中的 Skill，并更新可审计的累计统计。
 
-        这里的 ``used`` 是根据最终回答是否体现 Skill 的独特流程推断出来的，不代表
-        Runtime 已确认主模型实际调用过 ``skill`` 工具；显式调用由 invocation 日志另记。
+        ``inferred_used`` 只是回答行为推测；``invoked`` 由 Runtime 的真实调用路径记录。
         """
         # 在线演化关闭时不产生任何辅助请求；Plan Mode 保持只读，也不更新统计文件。
         if not self._online_evolution_enabled() or self.permission_mode == "plan":
             return
         # 这些命中来自本轮请求前的自动检索，包含名称、描述、when_to_use、检索分数等，
         # 但不包含完整 SKILL.md 正文。
-        hits = list(self._last_retrieved_skill_hits or [])
+        hits = [dict(hit) for hit in retrieved_hits]
         # 没有候选就无从判断；空回复通常表示模型未正常完成，也不作为有效使用样本。
         if not hits or not assistant_text.strip():
             return
@@ -801,15 +862,17 @@ class Agent:
         # 只供输出结构化判断，不会把裁判过程写回主 Agent 的消息列表。
         side_query = self._build_side_query(max_tokens=700)
         try:
-            from .online_skill_evolution import judge_retrieved_skill_usage
+            from .online_skill_evolution import judge_retrieved_skill_adoption
             from .skills import record_usage_judgments
 
             # 裁判同时看到原始用户请求、最终回复和候选摘要，并为每个候选返回
-            # relevant（是否适用）与 used（回答是否体现其特有流程）。
-            judgments = await judge_retrieved_skill_usage(
+            # relevant（是否适用）与 inferred_used（回答是否看似采用其独特流程）。
+            judgments = await judge_retrieved_skill_adoption(
                 hits=hits,
                 user_message=original_user_message,
                 assistant_text=assistant_text,
+                surfaced_names=surfaced_names,
+                invoked_names=invoked_names,
                 side_query=side_query,
             )
             # 将本轮判断累加到 skill_usage_stats.json；达到长期无效阈值时可能归档 Skill。
@@ -838,8 +901,9 @@ class Agent:
         self._anthropic_messages = []
         self._openai_messages = []
         self._pending_skill_extraction_window = None
-        self._last_retrieved_skill_reference = None
         self._last_retrieved_skill_hits = []
+        self._last_surfaced_skill_hits = []
+        self._turn_invoked_skills = {}
         self._fold_last_time = 0.0
         self._fold_count = 0
         self._tool_error_streak = 0
@@ -1271,6 +1335,7 @@ class Agent:
 
         if not result:
             return f"Unknown skill: {inp.get('skill_name', '')}"
+        self._record_turn_skill_invocation(result)
 
         #fork 表示这个 skill 不直接把 prompt 塞回当前对话，而是要启动一个子 Agent 单独完成任务。
         if result["context"] == "fork":
