@@ -83,3 +83,5 @@ def get_latest_session_id() -> str | None:
         return None
     sessions.sort(key=lambda s: s.get("startTime", ""), reverse=True)
     return sessions[0].get("id")
+
+

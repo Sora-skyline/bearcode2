@@ -315,7 +315,7 @@ def retrieve_relevant_skills(
     doc_count = len(docs)
     k1 = 1.4
     b = 0.75
-    hits: list[dict[str, Any]] = []
+    hits: list[dict[str, Any]] = []# 返回的命中列表，每项包含 score、name、description 等字段。
     for skill, terms in docs:
         term_counts = Counter(terms)
         overlap = query_tokens & set(term_counts)
