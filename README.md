@@ -4,9 +4,12 @@ Bear Agent 是一个基于 Python 实现的 **自进化 Harness Agent**。它不
 
 项目重点是 **Harness**：模型只负责推理和提出工具调用意图，真正的环境操作由 Bear Code Runtime 统一做权限判断、工具执行、结果回写、上下文压缩和经验沉淀。它适合学习 Claude Code 类工具的底层机制，也适合作为个人 Coding Agent、项目分析助手或领域 Agent 的二次开发基础。
 
+当前项目运行流程以 [`RUNTIME_FLOW.md`](RUNTIME_FLOW.md) 为唯一真相源；仓库采用 doc-first 约定，行为修改必须先更新流程文档和变更账本，再修改实现。
+
 ## 核心亮点
 
-- **自进化 Harness Agent**：从用户反馈中自动抽取可复用规则，新增或合并到 `SKILL.md`，让 Agent 能随着使用持续沉淀能力。
+- **可归因的 Skills 自进化**：先把跨轮反馈归因为 `skill_gap / capability_limit / evaluation_noise`，只有可修复缺口才能形成隔离 proposal；通过评测和显式发布后才新增或合并 active `SKILL.md`。
+- **双锚点回归治理**：候选在 dev 样本上选优后，在隔离 promotion-test 上逐样本对比当前 active，并继续通过历史 champion gate；平均分上涨不能掩盖已有能力回退。
 - **完整 Agent Loop**：模型请求、tool call 解析、权限检查、工具执行、tool result 回写、继续推理、会话保存形成闭环。
 - **OpenAI / Anthropic 双协议**：支持 OpenAI-compatible 和 Anthropic-compatible 接口，便于接入不同模型服务或代理网关。
 - **工具系统与权限控制**：支持读写文件、精确编辑、代码搜索、Shell 命令、Skill 调用、子 Agent 和 MCP 工具；Plan Mode 下阻断写操作和 Shell。
@@ -46,7 +49,8 @@ BearAgent/
 │   ├── tools.py                   # 内置工具和权限系统
 │   ├── prompt.py                  # System prompt 动态构建
 │   ├── skills.py                  # Skills 加载、检索、执行、创建和演化封装
-│   ├── online_skill_evolution.py  # 在线 Skill 抽取和 add/merge/discard 决策
+│   ├── online_skill_evolution.py  # 在线反馈归因、Skill 抽取和 add/merge/discard 决策
+│   ├── online_skill_eval.py       # replay、候选试跑、回归治理和 champion 记录
 │   ├── skill_evolution.py         # Skill 落盘、版本快照、审计统计
 │   ├── memory.py                  # 长期记忆系统
 │   ├── mcp_client.py              # MCP stdio JSON-RPC 客户端
@@ -186,40 +190,34 @@ BEAR_SKILL_USAGE_PRUNE_MAX_INVOKED=0
 含义：
 
 - `BEAR_AUTO_SKILL_EVOLUTION=1`：启用在线 Skill 自进化。
-- `BEAR_AUTO_SKILL_TARGET=project`：自动新增的 Skill 写入当前项目 `.bear/skills/`。
+- `BEAR_AUTO_SKILL_TARGET=project`：proposal 记录未来发布到项目级 Skill。
 - `BEAR_SKILL_USAGE_PRUNE_MIN_SURFACED`：自动归档前要求的摘要注入样本数。
 - `BEAR_SKILL_USAGE_PRUNE_MAX_INVOKED`：允许自动归档的最大真实调用数。
 
-如果希望沉淀为所有项目共享的个人 Skill：
+如果希望通过评测后的新 Skill 最终发布为所有项目共享的个人 Skill：
 
 ```env
 BEAR_AUTO_SKILL_TARGET=user
 ```
 
-对应路径：
+proposal 一律先保存在项目隔离区；显式发布后的 active 路径为：
 
 ```text
 project: <project>/.bear/skills/<skill_name>/SKILL.md
 user:    ~/.bear/skills/<skill_name>/SKILL.md
 ```
 
-### 2. 用允许写入的权限模式启动
+### 2. 正常启动在线候选抽取
 
-后台自动写入 Skill 需要当前权限模式允许写文件。推荐使用：
+后台只生成 proposal，不需要为了在线演化开启绕过权限的模式：
 
 ```bash
 BEAR_AUTO_SKILL_EVOLUTION=1 \
 BEAR_AUTO_SKILL_TARGET=project \
-python3 -m agents.main --accept-edits
+python3 -m agents.main
 ```
 
-也可以使用更激进的模式：
-
-```bash
-python3 -m agents.main --yolo
-```
-
-不建议长期默认使用 `--yolo`，因为它会跳过确认。日常推荐 `--accept-edits`，既能让后台 Skill 写入正常发生，又不会绕过所有权限判断。
+评测通过后，再在 REPL 中执行 `/skill-promote <skill-name>`。这个显式命令才会创建或演化 active `SKILL.md`；`--accept-edits` 和 `--yolo` 都不会让后台 proposal 自动发布。
 
 ### 3. 给出可复用反馈
 
@@ -252,17 +250,27 @@ python3 -m agents.main --yolo
 第 N+1 轮用户反馈
   -> 合并进上一轮 window
   -> online_ingest()
-  -> Extractor 抽取候选 Skill
+  -> Attributor 判断 skill_gap / capability_limit / evaluation_noise
+  -> 仅对 skill_gap 抽取候选 Skill
   -> Maintainer 结合 skill_trace 判断 add / merge / discard
-  -> create_skill_file() 或 evolve_skill_file()
-  -> 写入 SKILL.md
-  -> 记录 provenance、usage stats 和版本快照
+  -> 写入隔离 proposal（active SKILL.md 不变）
+  -> /skill-eval：dev 增益 + promotion-test 质量 + 零回归 + champion 比较
+  -> /skill-promote <skill>：显式发布 champion 到 active SKILL.md
+  -> 记录 provenance、proposal 状态、评测产物和版本快照
 ```
 
 每轮 `skill_trace` 分开记录 `retrieved`（检索命中）、`surfaced`（摘要已注入）和
 `invoked`（完整 Skill 已真实展开）。只有 `invoked` 是确定性使用证据；检索 Top 1
 只用于提示和审计，不能直接成为 merge 目标。裁判模型输出的 `inferred_used` 仅表示
 最终回答看起来采用了某个流程，不参与自动归档或 champion 晋级。
+
+归因与候选抽取由一次隔离的辅助模型请求联合完成：缺工具、权限、网络、沙箱或运行时
+能力的问题会停在 `capability_limit`，证据不足或只是切换话题会停在
+`evaluation_noise`，不会通过修改提示词“伪修复”。`/skill-eval` 生成候选后，先在
+`mutate_dev` 上与 current active 的同批样本比较，再在 `promotion_test` 上逐
+`sample_id + rule_id` 计算 regression；默认要求零回归和零硬规则回归，最后才与历史
+champion 比较。评测通过只会更新隔离 champion，只有显式 `/skill-promote` 才改变 active。
+所有归因、proposal 生命周期和回归明细都会进入 provenance / run artifacts。
 
 核心文件：
 
@@ -280,6 +288,9 @@ agents/skill_evolution.py
 .bear/skill-evolution/online_provenance.jsonl
 .bear/skill-evolution/online_skill_provenance.json
 .bear/skill-evolution/skill_usage_stats.json
+.bear/skill-evolution/proposals.json
+.bear/skill-evolution/proposals/<proposal-id>/
+.bear/skill-evolution/online-eval/champions/
 .bear/skill-evolution/history/
 .bear/skill-evolution/pruned/
 ```
@@ -292,7 +303,7 @@ agents/skill_evolution.py
 /extract_now 这是一个可复用的写作规则
 ```
 
-在 `default` 模式下，显式抽取会走交互确认；在 `--accept-edits` 或 `--yolo` 下会更顺畅。
+显式抽取和后台抽取都只暂存 proposal，不会直接改变 Agent 当前加载的 Skill。
 
 ### 6. 手动创建 Skill
 
@@ -306,7 +317,15 @@ agents/skill_evolution.py
 /skill-evolve government-report-writing 以后政府报告类任务不要使用口语化表达，优先使用正式、稳健、可汇报的句式。
 ```
 
-### 8. 查看 Skills 和统计
+### 8. 评测并发布在线候选
+
+```text
+/skill-proposals
+/skill-eval
+/skill-promote government-report-writing
+```
+
+### 9. 查看 Skills 和统计
 
 ```text
 /skills
@@ -322,7 +341,7 @@ agents/skill_evolution.py
 | `--model`, `-m` | 指定模型，覆盖 `.env` 中的 `MODEL` |
 | `--api-base` | 覆盖 API base URL |
 | `--plan` | 只读规划模式 |
-| `--accept-edits` | 自动允许编辑类操作，推荐用于自动沉淀 Skills |
+| `--accept-edits` | 自动允许普通编辑类操作；在线 Skill 仍只生成 proposal |
 | `--yolo`, `-y` | 跳过确认 |
 | `--dont-ask` | 自动拒绝需要确认的操作，适合 CI |
 | `--resume` | 恢复最近会话 |
@@ -340,6 +359,9 @@ agents/skill_evolution.py
 | `/memory` | 列出长期记忆 |
 | `/skills` | 列出可用 Skills |
 | `/skill-stats` | 查看 Skill 使用和演化统计 |
+| `/skill-proposals` | 查看待评测、已评测和 champion proposals |
+| `/skill-eval` | 隔离试跑候选并执行晋级门禁 |
+| `/skill-promote <skill>` | 显式把已过门禁的 champion 发布为 active Skill |
 | `/extract_now [hint]` | 抽取当前 pending window |
 | `/skill-feedback <skill> <rating> [note]` | 记录 Skill 反馈 |
 | `/skill-evolve <skill> <lesson>` | 手动演化 Skill |
@@ -433,7 +455,7 @@ docker run --rm -it \
   bear-code
 ```
 
-允许自动沉淀 Skills：
+允许自动抽取 Skill proposals（不会自动发布 active）：
 
 ```bash
 docker run --rm -it \
@@ -443,7 +465,7 @@ docker run --rm -it \
   -v "$PWD:/workspace" \
   -v bear-code-sessions:/root/.bear-code \
   -v bear-code-memory:/root/.BearCode \
-  bear-code --accept-edits
+  bear-code
 ```
 
 ## 重要数据路径

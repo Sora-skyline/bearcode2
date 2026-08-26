@@ -44,7 +44,11 @@ from .skills import (
     record_feedback,
     skill_stats,
 )
-from .online_skill_eval import format_online_skill_eval_async
+from .online_skill_eval import (
+    format_online_skill_eval_async,
+    format_skill_proposals,
+    publish_online_skill_champion,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -266,6 +270,24 @@ async def run_repl(agent: Agent) -> None:
             side_query = agent._build_side_query(max_tokens=2400, purpose="skill-eval")
             print_info(await format_online_skill_eval_async(side_query=side_query))
             continue
+        if inp == "/skill-proposals":
+            print_info(format_skill_proposals())
+            continue
+        if inp.startswith("/skill-promote "):
+            skill_name = inp[len("/skill-promote ") :].strip()
+            if not skill_name:
+                print_error("Usage: /skill-promote <skill-name>")
+                continue
+            result = publish_online_skill_champion(skill_name)
+            if result.get("ok"):
+                agent._refresh_runtime_system_prompt()
+                print_info(
+                    f"Published evaluated champion for {result.get('skill')} "
+                    f"as active ({result.get('publish_action')})."
+                )
+            else:
+                print_error(str(result.get("error") or result))
+            continue
         if inp.startswith("/extract_now"):
             hint = inp[len("/extract_now") :].strip()
             result = await agent.extract_now(hint)
@@ -392,6 +414,8 @@ REPL commands:
   /skills             List available skills
   /skill-stats        Show skill usage and evolution stats
   /skill-eval         Evaluate online skill evolution quality
+  /skill-proposals    List staged online skill proposals
+  /skill-promote      Publish an evaluated champion: /skill-promote <skill>
   /extract_now        Extract the current pending online skill window: /extract_now [hint]
   /skill-feedback     Record feedback: /skill-feedback <skill> <rating> [note]
   /skill-evolve       Evolve a skill: /skill-evolve <skill> <durable lesson>

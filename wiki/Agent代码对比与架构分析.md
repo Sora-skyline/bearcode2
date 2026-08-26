@@ -336,7 +336,7 @@ skill_evolution.py 负责：
 
 ### 8.4 在线评测
 
-online_skill_eval.py 从真实 provenance 冻结 replay 数据，编译启发式规则和可选 LLM judge，生成候选变体并试跑。champion 只记录当前 lineage 的最佳候选，不直接覆盖 active SKILL.md，这个边界能避免评测阶段未经审批修改生产 Skill。
+online_skill_eval.py 从真实 provenance 冻结 replay 数据，把在线 proposal 与 heuristic / LLM 变体放入统一候选池并试跑。champion 只记录当前 lineage 的最佳候选，不直接覆盖 active SKILL.md；只有显式 `/skill-promote` 才发布已过门禁版本。
 
 ## 9. 风险与待改进项
 
