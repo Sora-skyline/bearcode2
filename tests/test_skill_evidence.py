@@ -3,19 +3,30 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 from agents.agent import Agent
-from agents.online_skill_eval import _skill_status
+from agents.online_skill_eval import (
+    _candidate_governance_gate,
+    _cross_version_regression,
+    _proposal_candidate_variants,
+    _regression_gate_passed,
+    _skill_status,
+    evaluate_online_skill_evolution_async,
+    publish_online_skill_champion,
+)
 from agents.skill_evolution import (
     ONLINE_PROVENANCE_LOG,
     SKILL_USAGE_STATS,
     format_skill_stats,
     get_evolution_dir,
+    load_skill_proposals,
     load_skill_stats,
     record_online_skill_provenance,
     record_skill_invocation,
     record_skill_usage_judgments,
+    stage_skill_proposal,
+    update_skill_proposal,
 )
 from agents.skills import SkillDefinition, execute_skill
 
@@ -322,6 +333,169 @@ class SkillUsageStatsTests(unittest.TestCase):
         self.assertEqual(self._stats()["inferred-only"]["inferred_used"], 1)
 
 
+class SkillProposalLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self._old_cwd = Path.cwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._tmp.cleanup()
+
+    def test_stage_writes_isolated_candidate_without_creating_active_skill(self):
+        result = stage_skill_proposal(
+            skill_name="risk-first-review",
+            requested_action="add",
+            snapshot={
+                "name": "risk-first-review",
+                "description": "Lead reviews with concrete risks",
+                "when_to_use": "When reviewing code",
+                "instructions": "List correctness risks before summaries.",
+                "context": "inline",
+                "source": "project",
+            },
+            evidence="user correction",
+            attribution={"root_cause": "skill_gap"},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "propose")
+        self.assertTrue(Path(result["proposal_file"]).is_file())
+        self.assertFalse((Path.cwd() / ".bear" / "skills" / "risk-first-review" / "SKILL.md").exists())
+        proposals = load_skill_proposals(skill_name="risk-first-review")
+        self.assertEqual(proposals[0]["status"], "pending")
+        self.assertEqual(proposals[0]["attribution"]["root_cause"], "skill_gap")
+
+    def test_status_updates_registry_and_reviewable_skill_copy(self):
+        result = stage_skill_proposal(
+            skill_name="review-style",
+            requested_action="add",
+            snapshot={
+                "name": "review-style",
+                "description": "Review style",
+                "instructions": "Lead with risks.",
+            },
+        )
+
+        updated = update_skill_proposal(result["proposal_id"], status="champion", evaluation={"run_id": "r1"})
+
+        self.assertTrue(updated["ok"])
+        self.assertEqual(load_skill_proposals(skill_name="review-style")[0]["status"], "champion")
+        self.assertIn("proposal-status: champion", Path(result["proposal_file"]).read_text(encoding="utf-8"))
+
+    def test_only_pending_or_evaluated_proposals_enter_candidate_eval(self):
+        proposals = [
+            {"proposal_id": "p1", "skill": "review", "status": "pending", "snapshot": {"instructions": "A"}},
+            {"proposal_id": "p2", "skill": "review", "status": "published", "snapshot": {"instructions": "B"}},
+        ]
+
+        variants = _proposal_candidate_variants(skill_name="review", proposals=proposals)
+
+        self.assertEqual([item["proposal_id"] for item in variants], ["p1"])
+
+    def test_publish_requires_governed_champion(self):
+        champion = {
+            "snapshot": {
+                "name": "risk-first-review",
+                "description": "Lead reviews with concrete risks",
+                "instructions": "List risks first.",
+                "source": "project",
+            },
+            "promotion": {"promoted": True},
+            "source_proposal_id": "p1",
+            "updated_at": "2026-08-26T00:00:00Z",
+        }
+        with (
+            patch("agents.online_skill_eval._load_champion", return_value=champion),
+            patch("agents.skills.get_skill_by_name", return_value=None),
+            patch("agents.skills.create_skill", return_value={"ok": True, "action": "create", "version": "0.1.0"}) as create,
+            patch("agents.online_skill_eval.update_skill_proposal") as update,
+        ):
+            result = publish_online_skill_champion("risk-first-review")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["action"], "publish")
+        create.assert_called_once()
+        update.assert_called_once_with("p1", status="published", evaluation=ANY)
+
+    def test_publish_rejects_missing_or_unapproved_champion(self):
+        with (
+            patch(
+                "agents.online_skill_eval._load_champion",
+                return_value={"snapshot": {"name": "review", "instructions": "A"}, "promotion": {"promoted": False}},
+            ),
+            patch("agents.skills.create_skill") as create,
+        ):
+            result = publish_online_skill_champion("review")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("not approved", result["error"])
+        create.assert_not_called()
+
+
+class SkillProposalEvaluationIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._old_cwd = Path.cwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._tmp.cleanup()
+
+    async def test_pending_proposal_can_become_champion_without_touching_active(self):
+        proposal = stage_skill_proposal(
+            skill_name="answer-first",
+            requested_action="add",
+            snapshot={
+                "name": "answer-first",
+                "description": "Lead with the conclusion",
+                "when_to_use": "When answering analytical questions",
+                "instructions": "Lead with the conclusion before details.",
+                "source": "project",
+            },
+            attribution={"root_cause": "skill_gap"},
+        )
+        for index in range(2):
+            record_online_skill_provenance(
+                action="propose",
+                skill_name="answer-first",
+                result={"ok": True, "action": "propose", "proposal_id": proposal["proposal_id"]},
+                messages=[
+                    {"role": "user", "content": f"Question {index}"},
+                    {"role": "assistant", "content": "Background details without a direct answer."},
+                    {"role": "user", "content": f"Please answer first next time {index}."},
+                ],
+            )
+
+        async def side_query(system, payload):
+            if "strict binary evaluator" in system:
+                response = json.loads(payload).get("response", "")
+                return json.dumps({"pass": response.startswith("Conclusion:"), "reason": "answer position"})
+            if "improve a local agent Skill" in system:
+                return "{}"
+            return "Conclusion: approved. Supporting details follow."
+
+        report = await evaluate_online_skill_evolution_async(
+            side_query=side_query,
+            min_replay_samples=2,
+            min_promotion_tests=1,
+            min_retrieved=0,
+            min_invocations=0,
+            min_relevance_rate=0.0,
+            write_report=False,
+            write_artifacts=True,
+        )
+
+        skill_report = next(item for item in report["skills"] if item["skill"] == "answer-first")
+        promotion = skill_report["artifacts"]["promotion"]
+        self.assertTrue(promotion["promoted"])
+        self.assertTrue(promotion["candidate_gate"]["selected_for_promotion"])
+        self.assertEqual(load_skill_proposals(skill_name="answer-first")[0]["status"], "champion")
+        self.assertFalse((Path.cwd() / ".bear" / "skills" / "answer-first" / "SKILL.md").exists())
+
+
 class OnlineEvalGateTests(unittest.TestCase):
     def test_verified_invocation_is_required_for_healthy_status(self):
         common = {
@@ -345,6 +519,82 @@ class OnlineEvalGateTests(unittest.TestCase):
 
         status, _ = _skill_status(invoked=1, **common)
         self.assertEqual(status, "healthy")
+
+
+class CandidateRegressionGovernanceTests(unittest.TestCase):
+    def test_regression_is_measured_per_sample_and_rule(self):
+        current = [
+            {"sample_id": "s1", "rule_id": "correctness", "passed": True, "hard": True},
+            {"sample_id": "s2", "rule_id": "style", "passed": True, "hard": False},
+            {"sample_id": "s3", "rule_id": "correctness", "passed": False, "hard": True},
+        ]
+        candidate = [
+            {"sample_id": "s1", "rule_id": "correctness", "passed": False, "hard": True},
+            {"sample_id": "s2", "rule_id": "style", "passed": True, "hard": False},
+            {"sample_id": "s3", "rule_id": "correctness", "passed": True, "hard": True},
+        ]
+
+        regression = _cross_version_regression(
+            current_outcomes=current,
+            candidate_outcomes=candidate,
+        )
+
+        self.assertEqual(regression["baseline_passed"], 2)
+        self.assertEqual(regression["regressed"], 1)
+        self.assertEqual(regression["hard_regressions"], 1)
+        self.assertEqual(regression["regression_rate"], 0.5)
+        self.assertFalse(_regression_gate_passed(regression))
+
+    def test_zero_regression_candidate_passes_governance(self):
+        current = [
+            {"sample_id": "s1", "rule_id": "correctness", "passed": True, "hard": True},
+        ]
+        candidate = [
+            {"sample_id": "s1", "rule_id": "correctness", "passed": True, "hard": True},
+        ]
+
+        regression = _cross_version_regression(
+            current_outcomes=current,
+            candidate_outcomes=candidate,
+        )
+
+        self.assertEqual(regression["regression_rate"], 0.0)
+        self.assertTrue(_regression_gate_passed(regression))
+
+    def test_higher_dev_score_cannot_hide_promotion_test_regression(self):
+        gate = _candidate_governance_gate(
+            current_dev_summary={"average_score": 1.0, "hard_failures": 0},
+            candidate_dev_summary={"average_score": 2.0, "hard_failures": 0},
+            candidate_test_summary={"average_score": 2.0, "hard_failures": 1},
+            regression={
+                "baseline_passed": 4,
+                "regressed": 1,
+                "hard_regressions": 1,
+                "regression_rate": 0.25,
+            },
+        )
+
+        self.assertTrue(gate["dev_improved"])
+        self.assertFalse(gate["regression_passed"])
+        self.assertFalse(gate["selected_for_promotion"])
+
+    def test_candidate_needs_dev_gain_test_quality_and_zero_regression(self):
+        gate = _candidate_governance_gate(
+            current_dev_summary={"average_score": 1.0, "hard_failures": 0},
+            candidate_dev_summary={"average_score": 1.5, "hard_failures": 0},
+            candidate_test_summary={"average_score": 1.5, "hard_failures": 0, "rule_pass_rate": 1.0},
+            regression={
+                "baseline_passed": 4,
+                "regressed": 0,
+                "hard_regressions": 0,
+                "regression_rate": 0.0,
+            },
+        )
+
+        self.assertTrue(gate["dev_improved"])
+        self.assertTrue(gate["test_quality_passed"])
+        self.assertTrue(gate["regression_passed"])
+        self.assertTrue(gate["selected_for_promotion"])
 
 
 if __name__ == "__main__":

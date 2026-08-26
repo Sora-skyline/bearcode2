@@ -1,12 +1,145 @@
-# Bear Code：从命令输入到文本输出的完整调用流程
+# Bear Code 当前项目流程（Single Source of Truth）
 
-本文描述 Bear Code 收到一条普通自然语言命令后，如何完成启动、模型调用、工具执行、流式文本输出和会话保存。
+本文是 Bear Code 当前行为的唯一流程真相源，描述命令入口、模型循环、工具执行、会话保存，以及在线 Skills 从反馈归因到显式发布的完整链路。
+
+最后校验日期：2026-08-26。
+
+## 0. 流程文档维护协议
+
+所有实现修改都执行 doc-first：
+
+```text
+提出修改
+  -> 先阅读本文件相关章节
+  -> 先更新流程说明并在变更账本登记 planned
+  -> 再修改实现 / 测试 / 配置
+  -> 运行对应验证
+  -> 把账本状态改为 verified，并记录验证结果
+```
+
+规则：
+
+- `RUNTIME_FLOW.md` 描述“代码当前真实怎么运行”，不是未来规划。
+- README 和 wiki 是面向使用、学习、面试的派生文档；行为冲突时以本文件和代码为准，并应在同次改动中修正。
+- 如果修改不改变运行流程，也要登记 `flow unchanged`，避免文档是否检查过无法追踪。
+- 新记录追加在下表顶部，保留历史，不覆盖旧记录。
+
+### 变更账本
+
+| 日期 | 状态 | 修改 | 受影响流程 | 验证 |
+| --- | --- | --- | --- | --- |
+| 2026-08-26 | verified | 用 Mermaid 重绘项目总流程与在线 Skill 治理图（flow unchanged） | 第 1.2、8.1、8.2 节 | 4 个 Mermaid 代码块、章节结构与 `git diff --check` 通过 |
+| 2026-08-26 | verified | 重构为“项目核心总流程 → 分流程”阅读结构（flow unchanged） | 全文结构 | 章节编号、交叉引用与 `git diff --check` 通过 |
+| 2026-08-26 | verified | 在线 Skill 改为 candidate-first，并建立 doc-first 维护协议 | 输入、Agent、在线 Skills、源码索引 | `pytest`: 36 passed；Ruff E9/F 与 `git diff --check` 通过 |
 
 文中的“每一个函数”指这条运行链路上由 Bear Code 项目定义的函数。Python、`asyncio`、Rich、Anthropic/OpenAI SDK 等第三方库内部调用不展开。标有“条件”的函数只在对应分支发生。
 
-## 1. 两种输入入口
+## 1. 项目核心总流程
 
-### 1.1 一次性命令
+Bear Code 的核心不是“模型接收一句话并回复”，而是一个带安全边界、长期状态和受控能力演化的 Agentic Harness：模型负责推理和提出动作，Runtime 负责上下文组装、权限判断、工具执行、状态持久化和质量治理。
+
+### 1.1 五个核心能力
+
+| 核心 | 解决的问题 | 主要实现 |
+| --- | --- | --- |
+| Agent Loop | 让模型在“推理 → 行动 → 观察”之间循环，直到完成任务 | `agents/agent.py` |
+| 工具与权限边界 | 模型只能提出 tool call，真正的文件、Shell、Skill、MCP 操作由 Runtime 审批和执行 | `agents/tools.py`、`agents/agent.py` |
+| 上下文连续性 | 用 Session、上下文折叠和 Memory 保持长任务状态，同时控制上下文体积 | `agents/session.py`、`agents/memory.py` |
+| 可扩展能力 | 通过 Skills、MCP 和子 Agent 扩展任务方法、外部工具与隔离执行能力 | `agents/skills.py`、`agents/mcp_client.py`、`agents/subagent.py` |
+| 受控自进化 | 将用户反馈先归因、再形成 proposal，经 replay 和双锚点门禁验证后显式发布 | `agents/online_skill_evolution.py`、`agents/online_skill_eval.py` |
+
+### 1.2 端到端总流程
+
+```mermaid
+flowchart TD
+    U[用户任务] --> E[CLI / REPL 入口]
+    E --> CFG[解析模型、权限、预算与会话配置]
+    CFG --> INIT[创建 Agent / 可选恢复 Session]
+
+    subgraph CONTEXT[上下文连续性与能力装配]
+        PROMPT[System Prompt<br/>项目规则 / Git 状态]
+        SKILLS[active Skills<br/>清单与相关 Skill 检索]
+        MEMORY[Memory<br/>索引与异步预取]
+        EXT[MCP / 子 Agent<br/>内置工具定义]
+    end
+
+    INIT --> PROMPT
+    INIT --> SKILLS
+    INIT --> MEMORY
+    INIT --> EXT
+    PROMPT --> LOOP
+    SKILLS --> LOOP
+    MEMORY --> LOOP
+    EXT --> LOOP
+
+    subgraph HARNESS[Agentic Harness 核心循环]
+        LOOP[调用 OpenAI / Anthropic 模型]
+        OUT{模型输出类型}
+        PERM{Runtime 权限检查<br/>与 Plan Mode 限制}
+        ACTION[执行内置工具 / Skill<br/>MCP / 子 Agent]
+        RESULT[tool result 回写模型]
+        STREAM[流式输出最终文本]
+
+        LOOP --> OUT
+        OUT -->|tool call| PERM
+        PERM -->|允许| ACTION
+        PERM -->|拒绝| RESULT
+        ACTION --> RESULT
+        RESULT --> LOOP
+        OUT -->|最终文本| STREAM
+    end
+
+    STREAM --> SESSION[保存 Session 与任务状态]
+    SESSION --> EVIDENCE[后台证据链<br/>usage tracking + pending window]
+    EVIDENCE --> FEEDBACK{下一轮反馈归因}
+    FEEDBACK -->|capability_limit| AUDIT[只记录 provenance]
+    FEEDBACK -->|evaluation_noise| AUDIT
+    FEEDBACK -->|skill_gap| MAINTAINER[Maintainer<br/>add / merge / discard]
+    MAINTAINER -->|add / merge| PROPOSAL[隔离 proposal<br/>active 不变]
+    MAINTAINER -->|discard| AUDIT
+
+    PROPOSAL --> LIST["/skill-proposals<br/>查看候选"]
+    LIST --> EVAL["/skill-eval<br/>dev + promotion-test + regression"]
+    EVAL --> GATE{优于 current active<br/>且优于历史 champion?}
+    GATE -->|否| EVALUATED[evaluated<br/>继续积累证据]
+    GATE -->|是| CHAMPION[隔离 champion]
+    CHAMPION --> PROMOTE["/skill-promote<br/>显式发布"]
+    PROMOTE --> ACTIVE[刷新 active Skills<br/>与 System Prompt]
+    ACTIVE --> LOOP
+```
+
+其中有三条不可绕过的边界：
+
+- 模型不能直接操作环境，所有动作都经过 Runtime 工具与权限层。
+- 后台在线演化不能直接修改 active Skill，只能生成隔离 proposal。
+- `/skill-eval` 只记录 champion，只有显式 `/skill-promote` 才改变线上能力。
+
+### 1.3 核心状态与持久化
+
+| 状态 | 位置 | 生命周期 |
+| --- | --- | --- |
+| 当前模型消息与任务状态 | `.bear/sessions/` | 每次对话保存，可通过 `--resume` 恢复 |
+| 长期项目记忆 | Memory 目录与索引 | 按项目隔离，检索后按需注入 |
+| 当前生效能力 | `.bear/skills/`、`~/.bear/skills/` | 被 `discover_skills()` 加载进入 Runtime |
+| 在线候选 | `.bear/skill-evolution/proposals/` | `pending → evaluated → champion → published` |
+| Replay 与 champion | `.bear/skill-evolution/online-eval/` | 跨评测运行保留，用于回放、回归和版本比较 |
+| 使用与来源证据 | `.bear/skill-evolution/*.json*` | append-only 事件与派生索引结合 |
+
+### 1.4 后续分流程导航
+
+| 分流程 | 对应章节 |
+| --- | --- |
+| 输入入口 | 第 2 节 |
+| 启动、配置与会话恢复 | 第 3 节 |
+| 用户输入进入 Agent、MCP 与 Skill 检索 | 第 4 节 |
+| Anthropic / OpenAI 模型链路 | 第 5、6 节 |
+| 工具、权限和结果回环 | 第 7 节 |
+| 最终收尾、在线 proposal、评测与发布 | 第 8 节 |
+| 最短路径与源码入口 | 第 9、10 节 |
+
+## 2. 分流程：两种输入入口
+
+### 2.1 一次性命令
 
 ```bash
 python -m agents.main "读取 requirements.txt 并解释依赖"
@@ -31,7 +164,7 @@ Python 执行 agents.main
 
 命令行中位置参数 `prompt` 非空时，`main()` 将所有片段用空格拼成字符串，然后进入 `run_one_shot()`。模型完成最终回复后进程退出。
 
-### 1.2 REPL 交互输入
+### 2.2 REPL 交互输入
 
 ```bash
 python -m agents.main
@@ -55,13 +188,29 @@ Python 执行 agents.main
 
 `run_repl()` 每轮读取一行。`exit`/`quit` 调用 `ui.print_goodbye()` 后退出；以 `/` 开头的内置命令在 REPL 本地分派，普通文本才进入 `Agent.chat()`。
 
+在线 Skill 治理命令在模型主循环外本地分派：
+
+```text
+/skill-proposals
+  -> online_skill_eval.format_skill_proposals()
+
+/skill-eval
+  -> Agent._build_side_query()
+  -> online_skill_eval.format_online_skill_eval_async()
+
+/skill-promote <skill-name>
+  -> online_skill_eval.publish_online_skill_champion()
+  -> skills.create_skill() 或 skills.evolve_skill()      [门禁已通过]
+  -> Agent._refresh_runtime_system_prompt()              [发布成功]
+```
+
 REPL 和一次性命令的区别只在输入与退出方式。两者最终都调用同一个 `Agent.chat()`，模型及工具运行链路完全相同。
 
-## 2. 启动与配置解析
+## 3. 分流程：启动与配置解析
 
 入口文件是 `agents/main.py`。
 
-### 2.1 参数与 `.env`
+### 3.1 参数与 `.env`
 
 `main.main()` 依次调用：
 
@@ -74,7 +223,7 @@ REPL 和一次性命令的区别只在输入与退出方式。两者最终都调
    - path 以 `/anthropic` 结尾或包含 `/anthropic/` 时选择 Anthropic SDK；其他非空 URL 选择 OpenAI SDK。
 5. 模型名按 `--model`、`MODEL`、`deepseek-chat` 的优先级确定。
 
-### 2.2 创建 Agent
+### 3.2 创建 Agent
 
 `main()` 调用 `Agent.__init__()`。初始化期间的项目函数调用是：
 
@@ -117,7 +266,7 @@ Agent.__init__()
 
 `build_system_prompt()` 将当前目录、日期、平台、Shell、Git 状态、`CLAUDE.md`、`.bear/rules`、记忆索引、Skill 描述、子 Agent 描述和延迟工具名称组装为最终系统提示词。
 
-### 2.3 恢复会话（条件）
+### 3.3 恢复会话（条件）
 
 传入 `--resume` 时，`main()` 额外调用：
 
@@ -133,7 +282,7 @@ Agent.restore_session()
    └─ Agent._anthropic_tool_result_ids()
 ```
 
-## 3. 一条普通输入进入 Agent
+## 4. 分流程：一条普通输入进入 Agent
 
 一次性模式由 `run_one_shot()` 调用 `Agent.chat()`；REPL 则直接调用 `Agent.chat()`。
 
@@ -162,7 +311,9 @@ Agent.chat(user_message)
       └─ session._ensure_dir()
 ```
 
-### 3.1 第一次聊天时加载 MCP
+这里的后台 online evolution 只允许生成隔离 proposal，不会刷新 System Prompt，也不会改变本轮或下一轮加载的 active Skill。active 变化只来自显式 `/skill-promote`、`/skill-create` 或 `/skill-evolve`。
+
+### 4.1 第一次聊天时加载 MCP
 
 `Agent.chat()` 只在主 Agent 的第一次聊天中调用 `McpManager.load_and_connect()`：
 
@@ -184,15 +335,15 @@ McpManager.load_and_connect()
 
 单个 MCP Server 失败只打印错误，不会阻止主模型继续运行。成功发现的工具由 `get_tool_definitions()` 加上 `mcp__<server>__<tool>` 前缀，再追加到 Agent 工具列表。
 
-### 3.2 Skill 自动检索
+### 4.2 Skill 自动检索
 
 `_augment_user_message_with_skill_context()` 调用 `format_retrieved_skill_context()`，后者根据用户文本检索相关 Skill。命中时，Skill 内容以 `<retrieved_skills>` 运行时片段追加到用户输入中；原始输入仍单独保留，供后续使用统计和在线演化使用。
 
-## 4. Anthropic-compatible 文本输出链路
+## 5. 分流程：Anthropic-compatible 模型链路
 
 当前配置的 API URL 包含 `/anthropic` 时走这条链路。
 
-### 4.1 每轮模型调用
+### 5.1 每轮模型调用
 
 ```text
 Agent._chat_anthropic(user_message)
@@ -224,13 +375,13 @@ Agent._chat_anthropic(user_message)
 │  ├─ ui.stop_spinner()                                  [主 Agent]
 │  ├─ Agent._block_to_dict()                             [每个响应 block]
 │  ├─ 无 tool_use：ui.print_cost() → break
-│  └─ 有 tool_use：进入第 6 节的工具循环，然后继续 while
+│  └─ 有 tool_use：进入第 7 节的工具循环，然后继续 while
 └─ 返回 Agent.chat()
 ```
 
 `_run_compression_pipeline()` 每轮请求前整理旧工具结果。只有上下文达到阈值时才真正裁剪内容。
 
-### 4.2 SDK 流与终端文本
+### 5.2 SDK 流与终端文本
 
 ```text
 Agent._call_anthropic_stream()
@@ -267,11 +418,11 @@ Anthropic SSE event
 → sys.stdout.write()
 ```
 
-## 5. OpenAI-compatible 文本输出链路
+## 6. 分流程：OpenAI-compatible 模型链路
 
 非 `/anthropic` 的非空 API Base URL 走 OpenAI 分支。
 
-### 5.1 每轮模型调用
+### 6.1 每轮模型调用
 
 ```text
 Agent._chat_openai(user_message)
@@ -280,7 +431,7 @@ Agent._chat_openai(user_message)
 ├─ memory.start_memory_prefetch()                        [主 Agent]
 │  ├─ memory.get_memory_dir()
 │  │  └─ memory._project_hash()
-│  └─ memory.select_relevant_memories()                  [异步任务；子调用同 4.1]
+│  └─ memory.select_relevant_memories()                  [异步任务；子调用同 5.1]
 ├─ while True
 │  ├─ Agent._run_compression_pipeline()
 │  │  ├─ Agent._budget_tool_results_openai()
@@ -291,11 +442,11 @@ Agent._chat_openai(user_message)
 │  ├─ Agent._call_openai_stream()
 │  ├─ ui.stop_spinner()                                  [主 Agent]
 │  ├─ 无 tool_calls：ui.print_cost() → break
-│  └─ 有 tool_calls：进入第 6 节的工具循环，然后继续 while
+│  └─ 有 tool_calls：进入第 7 节的工具循环，然后继续 while
 └─ 返回 Agent.chat()
 ```
 
-### 5.2 SDK 流与终端文本
+### 6.2 SDK 流与终端文本
 
 ```text
 Agent._call_openai_stream()
@@ -315,7 +466,7 @@ Agent._call_openai_stream()
 
 `_call_openai_stream()` 同样由 `_with_retry(_do)` 包裹。模型分片中的工具参数会按 `tool_call.index` 拼接，流结束后重组为完整 `tool_calls`。
 
-## 6. 模型调用工具后的完整回环
+## 7. 分流程：工具、权限与完整回环
 
 模型第一次回复不一定包含最终文本。例如它可能先要求读取 `requirements.txt`：
 
@@ -328,7 +479,7 @@ Agent._call_openai_stream()
 → 终端流式输出
 ```
 
-### 6.1 共用工具分派
+### 7.1 共用工具分派
 
 Anthropic 和 OpenAI 两条循环都会对每个工具调用执行：
 
@@ -368,7 +519,7 @@ ui.print_tool_result()
 
 权限拒绝或用户拒绝时不会调用实际工具，但仍会构造一个失败的工具结果返回模型，使消息协议保持完整。
 
-### 6.2 内置工具内部调用
+### 7.2 内置工具内部调用
 
 `tools.execute_tool()` 根据工具名继续分派：
 
@@ -386,7 +537,7 @@ ui.print_tool_result()
 
 `read_file_state` 保存最近一次成功读取文件时的修改时间。写入已有文件之前，`execute_tool()` 要求该文件已经读取且未被外部修改。
 
-### 6.3 Anthropic 工具结果回传
+### 7.3 Anthropic 工具结果回传
 
 ```text
 Agent._chat_anthropic()
@@ -405,7 +556,7 @@ Agent._chat_anthropic()
 
 `read_file`、`list_files`、`grep_search` 属于 `CONCURRENCY_SAFE_TOOLS`。Anthropic 流式返回完整工具 block 时会先调用 `check_permission()`；若直接允许，便提前创建 `_execute_tool_call()` 异步任务，等完整模型响应结束后再收集结果。
 
-### 6.4 OpenAI 工具结果回传
+### 7.4 OpenAI 工具结果回传
 
 ```text
 Agent._chat_openai()
@@ -423,7 +574,7 @@ Agent._chat_openai()
 
 每次发现工具调用后，两个后端都会增加 `current_turns`，然后调用 `Agent._check_budget()`。该函数通过 `_get_current_cost_usd()` 检查 `--max-cost`，并检查 `--max-turns`。
 
-## 7. 最终文本输出后的收尾
+## 8. 分流程：收尾、在线演化与显式发布
 
 当模型响应不再包含工具调用时，后端循环调用 `ui.print_cost()` 并返回 `Agent.chat()`。随后：
 
@@ -439,7 +590,10 @@ Agent.chat()
 │     ├─ Agent._online_evolution_enabled()
 │     ├─ Agent._build_side_query()
 │     ├─ online_skill_evolution.online_ingest()
-│     └─ Agent._refresh_runtime_system_prompt()           [Skill 有变化]
+│     │  ├─ online_skill_evolution.analyze_online_feedback()
+│     │  ├─ online_skill_evolution.maintain_online_skill_candidate() [仅 skill_gap]
+│     │  └─ skill_evolution.stage_skill_proposal()        [add / merge]
+│     └─ Agent._emit_event("skill.proposed")              [proposal 成功]
 ├─ Agent._set_pending_skill_extraction_window()
 ├─ ui.print_divider()
 └─ Agent._auto_save()
@@ -448,7 +602,86 @@ Agent.chat()
 
 一次性模式还会调用 `Agent.drain_background_skill_tasks()`，等待本轮创建的后台 Skill 任务结束，然后进程退出。REPL 则回到 `while True`，重新调用 `ui.print_user_prompt()` 等待下一条输入；退出整个 REPL 前也会调用 `drain_background_skill_tasks()`。
 
-## 8. 最短成功路径
+### 8.1 在线 Skill proposal 状态机
+
+跨轮反馈首先进行可修复性归因：
+
+```mermaid
+flowchart LR
+    WINDOW[上一轮任务<br/>assistant 回复<br/>下一轮用户反馈] --> ATTR{Attributor<br/>可修复性归因}
+    ATTR -->|skill_gap| EXTRACT[Extractor<br/>生成可复用候选]
+    ATTR -->|capability_limit| CAP[记录 provenance<br/>不生成 proposal]
+    ATTR -->|evaluation_noise| NOISE[记录 provenance<br/>不生成 proposal]
+    EXTRACT --> MAINTAIN{Maintainer 决策}
+    MAINTAIN -->|add| ADD[新 Skill proposal]
+    MAINTAIN -->|merge| MERGE[已有 Skill 合并 proposal]
+    MAINTAIN -->|discard| DISCARD[记录 discard<br/>不生成 proposal]
+```
+
+proposal 保存在：
+
+```text
+.bear/skill-evolution/proposals.json
+.bear/skill-evolution/proposals/<proposal-id>/proposal.json
+.bear/skill-evolution/proposals/<proposal-id>/SKILL.md
+```
+
+proposal 的 `SKILL.md` 位于 active Skill 发现目录之外，因此不会被 `discover_skills()` 加载。状态按以下方向推进：
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: skill_gap + add / merge
+    pending --> evaluated: /skill-eval 完成
+    evaluated --> evaluated: 门禁未通过 / 重新评测
+    evaluated --> champion: 双锚点门禁通过
+    champion --> published: /skill-promote
+    published --> [*]
+```
+
+### 8.2 `/skill-eval` 候选治理
+
+```mermaid
+flowchart TD
+    START["/skill-eval"] --> LOAD[读取 provenance / usage<br/>active Skills / proposals]
+    LOAD --> LINEAGE[按 Skill lineage<br/>冻结 replay pool]
+    LINEAGE --> SPLIT[稳定划分<br/>mutate_dev / promotion_test]
+    SPLIT --> RULES[从 active 约束与最新 proposal<br/>编译评测规则]
+    RULES --> POOL[统一候选池<br/>proposal + heuristic + LLM]
+    POOL --> DEV[在同一 mutate_dev 上<br/>比较 current active 与 candidates]
+    DEV --> BEST[仅 dev 最优候选<br/>进入 promotion_test]
+    BEST --> QUALITY{零硬失败<br/>规则通过率达标?}
+    QUALITY -->|否| REJECT[evaluated<br/>active 不变]
+    QUALITY -->|是| REG{按 sample_id + rule_id<br/>相对 current active 零回归?}
+    REG -->|否| REJECT
+    REG -->|是| HISTORY{优于历史 champion?}
+    HISTORY -->|否| REJECT
+    HISTORY -->|是| CHAMPION[写隔离 champion<br/>proposal 标为 champion]
+```
+
+候选晋级必须同时满足：
+
+- mutate-dev 平均分至少提升 `DEFAULT_MIN_SCORE_DELTA`，且硬失败不增加。
+- promotion-test 没有硬失败，规则通过率至少为 `DEFAULT_MIN_RULE_PASS_RATE`。
+- current active 已通过的 `sample_id + rule_id` 项默认零回归。
+- 已有历史 champion 时，新候选还要取得最小分数增益且不增加硬失败。
+
+### 8.3 `/skill-promote` 显式发布
+
+```text
+/skill-promote <skill-name>
+  -> 根据 skill name 解析 lineage
+  -> 读取 champion.json
+  -> champion 不存在或 promotion gate 未通过：拒绝
+  -> active 已存在：skills.evolve_skill()
+  -> active 不存在：skills.create_skill()
+  -> proposal 状态更新为 published
+  -> 记录 publish provenance
+  -> 刷新 Runtime System Prompt
+```
+
+`--accept-edits` 和 `--yolo` 不会把后台 proposal 自动发布。手动 `/skill-create` 和 `/skill-evolve` 保留为用户显式授权的直接维护入口。
+
+## 9. 最短成功路径
 
 如果忽略初始化细节、没有 MCP、没有 Skill 命中、没有记忆命中、模型不调用工具，最短项目调用链如下。
 
@@ -487,7 +720,7 @@ main.main()
 → 等待下一条输入
 ```
 
-## 9. 相关源码入口
+## 10. 相关源码入口
 
 - `agents/main.py`：命令行参数、配置解析、一次性入口和 REPL。
 - `agents/agent.py`：Agent 生命周期、双后端模型循环、工具回环、输出、预算和会话收尾。
@@ -496,6 +729,9 @@ main.main()
 - `agents/prompt.py`：动态系统提示词组装。
 - `agents/mcp_client.py`：MCP 配置、stdio JSON-RPC、工具发现和路由。
 - `agents/skills.py`：Skill 发现、检索、调用和变更。
+- `agents/online_skill_evolution.py`：在线反馈归因、候选抽取和 proposal 决策。
+- `agents/skill_evolution.py`：proposal、active Skill、版本和审计持久化。
+- `agents/online_skill_eval.py`：replay、候选试跑、回归治理、champion 和显式发布。
 - `agents/memory.py`：长期记忆索引、检索预取和注入。
 - `agents/session.py`：会话持久化和恢复。
 
@@ -516,5 +752,11 @@ Agent 完成第二轮回答
     ↓
 后台分析上一轮任务、回答和当前反馈
     ↓
-决定是否创建或演化 Skill
+归因 skill_gap / capability_limit / evaluation_noise
+    ↓
+仅 skill_gap 形成隔离 proposal
+    ↓
+/skill-eval 通过双锚点门禁形成 champion
+    ↓
+/skill-promote 显式创建或演化 active Skill
 ```

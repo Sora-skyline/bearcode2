@@ -5,7 +5,8 @@
 但 champion 仅是本地最佳记录，不会覆盖 active SKILL.md。
 
 评测流水线可按五段阅读：加载在线证据 -> 冻结 replay 并稳定划分 dev/test -> 从 Skill
-文本编译规则 -> 在相同任务上比较当前版本与候选变体 -> 保存 run/champion 审计产物。
+文本编译规则 -> 在相同任务上比较当前版本与候选变体 -> 逐样本检查回归 -> 保存
+run/champion 审计产物。
 ``champion`` 与 active Skill 刻意分离，意味着一次离线评测不会悄悄改变 Agent 行为。
 """
 
@@ -23,7 +24,10 @@ from .skill_evolution import (
     ONLINE_PROVENANCE_LOG,
     SKILL_USAGE_STATS,
     get_evolution_dir,
+    load_skill_proposals,
     load_skill_stats,
+    record_online_skill_provenance,
+    update_skill_proposal,
 )
 
 
@@ -35,6 +39,7 @@ DEFAULT_MIN_RELEVANCE_RATE = 0.35
 DEFAULT_MIN_RULE_PASS_RATE = 0.8
 DEFAULT_DEV_SPLIT_RATIO = 0.75
 DEFAULT_MIN_SCORE_DELTA = 0.01
+DEFAULT_MAX_REGRESSION_RATE = 0.0
 ONLINE_EVAL_DIR = "online-eval"
 SideQuery = Callable[[str, str], Awaitable[str]]
 
@@ -170,7 +175,7 @@ def _action_bucket(action: str) -> str:
     raw = str(action or "none").strip().lower() or "none"
     if raw.endswith("_denied"):
         return "denied"
-    if raw in {"add", "merge", "discard", "none", "failed"}:
+    if raw in {"add", "merge", "propose", "publish", "discard", "none", "failed"}:
         return raw
     return "other"
 
@@ -789,6 +794,116 @@ def _summarize_outcomes_from_rows(
     }
 
 
+def _summary_for_samples(
+    *,
+    rules: list[dict[str, Any]],
+    samples: list[dict[str, Any]],
+    outcomes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """从已计算 outcomes 中提取同一 split 的摘要，避免跨样本比较分数。"""
+    sample_ids = {str(sample.get("sample_id") or "") for sample in samples}
+    selected = [
+        item
+        for item in outcomes
+        if str(item.get("sample_id") or "") in sample_ids
+    ]
+    return _summarize_outcomes_from_rows(rules=rules, samples=samples, outcomes=selected)
+
+
+def _cross_version_regression(
+    *,
+    current_outcomes: list[dict[str, Any]],
+    candidate_outcomes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """逐样本/规则比较当前 active 与候选，定位平均分掩盖的能力回退。"""
+
+    def outcome_key(item: dict[str, Any]) -> tuple[str, str]:
+        return str(item.get("sample_id") or ""), str(item.get("rule_id") or "")
+
+    current_passed = {
+        outcome_key(item): item
+        for item in current_outcomes
+        if item.get("passed") and all(outcome_key(item))
+    }
+    candidate_by_key = {
+        outcome_key(item): item
+        for item in candidate_outcomes
+        if all(outcome_key(item))
+    }
+    regressions: list[dict[str, Any]] = []
+    for key, current in sorted(current_passed.items()):
+        candidate = candidate_by_key.get(key)
+        if candidate is not None and candidate.get("passed"):
+            continue
+        regressions.append(
+            {
+                "sample_id": key[0],
+                "rule_id": key[1],
+                "hard": bool(current.get("hard")),
+                "candidate_missing": candidate is None,
+                "candidate_details": (candidate or {}).get("details", {}),
+            }
+        )
+
+    hard_regressions = sum(1 for item in regressions if item.get("hard"))
+    baseline_passed = len(current_passed)
+    return {
+        "baseline_passed": baseline_passed,
+        "regressed": len(regressions),
+        "hard_regressions": hard_regressions,
+        "regression_rate": _ratio(len(regressions), baseline_passed),
+        "details": regressions[:20],
+    }
+
+
+def _regression_gate_passed(
+    regression: dict[str, Any],
+    *,
+    max_regression_rate: float = DEFAULT_MAX_REGRESSION_RATE,
+) -> bool:
+    """硬规则零回退；软规则回退率不得超过显式阈值。"""
+    return bool(
+        int(regression.get("hard_regressions", 0) or 0) == 0
+        and float(regression.get("regression_rate", 0.0) or 0.0) <= float(max_regression_rate)
+    )
+
+
+def _candidate_governance_gate(
+    *,
+    current_dev_summary: dict[str, Any],
+    candidate_dev_summary: dict[str, Any],
+    candidate_test_summary: dict[str, Any],
+    regression: dict[str, Any],
+    min_score_delta: float = DEFAULT_MIN_SCORE_DELTA,
+) -> dict[str, Any]:
+    """组合 dev 增益与 promotion-test 回归约束，形成可审计候选门。"""
+    dev_improved = bool(
+        candidate_dev_summary
+        and current_dev_summary
+        and float(candidate_dev_summary.get("average_score", 0.0) or 0.0)
+        >= float(current_dev_summary.get("average_score", 0.0) or 0.0) + float(min_score_delta)
+        and int(candidate_dev_summary.get("hard_failures", 0) or 0)
+        <= int(current_dev_summary.get("hard_failures", 0) or 0)
+    )
+    regression_passed = bool(regression) and _regression_gate_passed(regression)
+    test_quality_passed = bool(
+        candidate_test_summary
+        and int(candidate_test_summary.get("hard_failures", 0) or 0) == 0
+        and float(candidate_test_summary.get("rule_pass_rate", 0.0) or 0.0) >= DEFAULT_MIN_RULE_PASS_RATE
+    )
+    selected = bool(test_quality_passed and dev_improved and regression_passed)
+    return {
+        "selected_for_promotion": selected,
+        "dev_improved": dev_improved,
+        "promotion_test_available": bool(candidate_test_summary),
+        "test_quality_passed": test_quality_passed,
+        "regression_passed": regression_passed,
+        "min_score_delta": min_score_delta,
+        "max_regression_rate": DEFAULT_MAX_REGRESSION_RATE,
+        "regression": regression,
+    }
+
+
 def _snapshot_with_instructions(snapshot: dict[str, Any], *, instructions: str, label: str) -> dict[str, Any]:
     """复制 Skill 快照并替换 instructions，构造不落盘的候选版本。"""
     out = dict(snapshot or {})
@@ -1023,6 +1138,7 @@ async def _evaluate_generated_variant_async(
 def _variant_summary_from_eval(variant: dict[str, Any], summary: dict[str, Any], sample_count: int) -> dict[str, Any]:
     return {
         "variant_id": variant.get("variant_id", ""),
+        "proposal_id": variant.get("proposal_id", ""),
         "label": variant.get("label", ""),
         "mutation_type": variant.get("mutation_type", ""),
         "parent_variant_id": variant.get("parent_variant_id", ""),
@@ -1037,6 +1153,38 @@ def _variant_summary_from_eval(variant: dict[str, Any], summary: dict[str, Any],
     }
 
 
+def _proposal_candidate_variants(
+    *,
+    skill_name: str,
+    proposals: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """把在线反馈产生的 pending proposal 转成候选试跑使用的统一结构。"""
+    variants: list[dict[str, Any]] = []
+    for proposal in proposals:
+        if not isinstance(proposal, dict):
+            continue
+        if str(proposal.get("skill") or "") != skill_name:
+            continue
+        if str(proposal.get("status") or "") not in {"pending", "evaluated"}:
+            continue
+        proposal_id = str(proposal.get("proposal_id") or "").strip()
+        snapshot = proposal.get("snapshot") if isinstance(proposal.get("snapshot"), dict) else {}
+        if not proposal_id or not str(snapshot.get("instructions") or "").strip():
+            continue
+        variants.append(
+            {
+                "variant_id": proposal_id,
+                "proposal_id": proposal_id,
+                "label": f"online_proposal:{proposal_id}",
+                "mutation_type": "online_proposal",
+                "parent_variant_id": "current_active",
+                "snapshot": dict(snapshot),
+                "notes": str(proposal.get("rationale") or proposal.get("evidence") or "online feedback proposal")[:1000],
+            }
+        )
+    return variants
+
+
 async def _build_candidate_eval_bundle_async(
     *,
     lineage_id: str,
@@ -1045,16 +1193,20 @@ async def _build_candidate_eval_bundle_async(
     rules: list[dict[str, Any]],
     rule_summary: dict[str, Any],
     side_query: SideQuery | None,
+    proposal_variants: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """在 mutate_dev 选择最佳候选，并在存在 promotion_test 时单独验证。"""
     if side_query is None or not replay_pool:
         # 同步模式或无真实样本时无法生成候选回复，因此跳过整个候选链路。
         return {}
-    variants = _build_heuristic_candidate_variants(
-        lineage_id=lineage_id,
-        snapshot=snapshot,
-        rules=rules,
-        rule_summary=rule_summary,
+    variants = list(proposal_variants or [])
+    variants.extend(
+        _build_heuristic_candidate_variants(
+            lineage_id=lineage_id,
+            snapshot=snapshot,
+            rules=rules,
+            rule_summary=rule_summary,
+        )
     )
     llm_variant = await _build_llm_candidate_variant_async(
         lineage_id=lineage_id,
@@ -1077,6 +1229,17 @@ async def _build_candidate_eval_bundle_async(
     # 候选选择只看 mutate_dev；没有 dev 的异常情况下才回退到全部样本。
     dev_samples = [sample for sample in replay_pool if sample.get("split") == "mutate_dev"] or list(replay_pool)
     test_samples = [sample for sample in replay_pool if sample.get("split") == "promotion_test"]
+    current_outcomes = [item for item in list(rule_summary.get("outcomes") or []) if isinstance(item, dict)]
+    current_dev_eval = _summary_for_samples(
+        rules=rules,
+        samples=dev_samples,
+        outcomes=current_outcomes,
+    )
+    current_dev_summary = _variant_summary_from_eval(
+        {"variant_id": "current_active", "label": "current_active", "mutation_type": "active"},
+        current_dev_eval,
+        len(dev_samples),
+    )
     outputs: list[dict[str, Any]] = []
     judgments: list[dict[str, Any]] = []
     scored: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
@@ -1100,8 +1263,9 @@ async def _build_candidate_eval_bundle_async(
         ),
         reverse=True,
     )
-    best_variant, best_dev_eval, best_dev_summary = scored[0]
+    best_variant, _best_dev_eval, best_dev_summary = scored[0]
     best_test_summary: dict[str, Any] = {}
+    regression: dict[str, Any] = {}
     if test_samples:
         # 只让 dev 最优候选进入 promotion_test，避免用测试集反复挑版本造成泄漏。
         test_outputs, test_outcomes, test_eval = await _evaluate_generated_variant_async(
@@ -1113,12 +1277,23 @@ async def _build_candidate_eval_bundle_async(
         outputs.extend(test_outputs)
         judgments.extend(test_outcomes)
         best_test_summary = _variant_summary_from_eval(best_variant, test_eval, len(test_samples))
+        current_test_outcomes = [
+            item
+            for item in current_outcomes
+            if item.get("split") == "promotion_test"
+        ]
+        regression = _cross_version_regression(
+            current_outcomes=current_test_outcomes,
+            candidate_outcomes=test_outcomes,
+        )
     return {
         "candidate_variants": deduped[:4],
         "variant_summaries": [item[2] for item in scored],
         "best_variant": best_variant,
+        "current_dev_summary": current_dev_summary,
         "best_dev_summary": best_dev_summary,
         "best_test_summary": best_test_summary,
+        "regression": regression,
         "outputs": outputs,
         "judgments": judgments,
     }
@@ -1236,6 +1411,102 @@ def _set_champion(lineage_id: str, payload: dict[str, Any]) -> None:
     snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
     if snapshot:
         _write_champion_skill_file(champion_dir / "SKILL.md", snapshot)
+
+
+def publish_online_skill_champion(skill_name: str) -> dict[str, Any]:
+    """显式把已评测 champion 发布为 active Skill；该函数不会由后台自动调用。"""
+    name = str(skill_name or "").strip()
+    if not name:
+        return {"ok": False, "error": "skill name is required"}
+    lineage_id = _lineage_id_for_skill(name)
+    champion = _load_champion(lineage_id)
+    snapshot = champion.get("snapshot") if isinstance(champion.get("snapshot"), dict) else {}
+    if not snapshot:
+        return {"ok": False, "error": f"no evaluated champion found for skill: {name}"}
+    promotion = champion.get("promotion") if isinstance(champion.get("promotion"), dict) else {}
+    if not promotion.get("promoted"):
+        return {"ok": False, "error": f"champion is not approved by the promotion gate: {name}"}
+
+    from .skills import create_skill, evolve_skill, get_skill_by_name
+
+    active = get_skill_by_name(name)
+    instructions = str(snapshot.get("instructions") or "").strip()
+    description = str(snapshot.get("description") or "").strip()
+    when_to_use = str(snapshot.get("when_to_use") or "").strip()
+    tags = [str(tag).strip() for tag in list(snapshot.get("tags") or []) if str(tag).strip()]
+    if active:
+        result = evolve_skill(
+            name,
+            lesson=f"Promote evaluated online champion {champion.get('updated_at', '')}",
+            rationale=f"Passed replay, regression, and champion gates for lineage {lineage_id}",
+            target="active",
+            instructions=instructions,
+            description=description,
+            when_to_use=when_to_use,
+            tags=tags,
+        )
+        publish_action = "merge"
+    else:
+        result = create_skill(
+            name=name,
+            description=description,
+            instructions=instructions,
+            when_to_use=when_to_use,
+            target=str(snapshot.get("source") or "project"),
+            context=str(snapshot.get("context") or "inline"),
+            user_invocable=bool(snapshot.get("user_invocable", False)),
+            evidence=f"Published from evaluated champion {lineage_id}",
+            actor="champion-publish",
+            tags=tags,
+        )
+        publish_action = "add"
+    if not result.get("ok"):
+        return {"action": "publish", "publish_action": publish_action, **result}
+
+    proposal_id = str(champion.get("source_proposal_id") or "")
+    if proposal_id:
+        update_skill_proposal(
+            proposal_id,
+            status="published",
+            evaluation={
+                "champion_updated_at": champion.get("updated_at", ""),
+                "published_at": _utc_now(),
+                "result": result,
+            },
+        )
+    published = {
+        "ok": True,
+        "action": "publish",
+        "publish_action": publish_action,
+        "skill": name,
+        "proposal_id": proposal_id,
+        "champion_file": str(_lineage_champion_dir(lineage_id) / "SKILL.md"),
+        **{key: value for key, value in result.items() if key not in {"action", "skill"}},
+    }
+    record_online_skill_provenance(
+        action="publish",
+        skill_name=name,
+        result=published,
+        decision={"source_proposal_id": proposal_id, "lineage_id": lineage_id},
+    )
+    return published
+
+
+def format_skill_proposals() -> str:
+    """返回 pending/evaluated/champion proposal 的紧凑人工审批视图。"""
+    proposals = load_skill_proposals()
+    if not proposals:
+        return "No online skill proposals found."
+    lines = ["Online skill proposals:"]
+    for proposal in proposals[-30:]:
+        lines.append(
+            "  "
+            f"{proposal.get('proposal_id')}: skill={proposal.get('skill')}, "
+            f"action={proposal.get('requested_action')}, status={proposal.get('status')}, "
+            f"created={proposal.get('created_at')}"
+        )
+    lines.append("Run /skill-eval to evaluate proposals, then /skill-promote <skill-name> to publish a champion.")
+    return "\n".join(lines)
 
 
 def _write_champion_skill_file(path: Path, snapshot: dict[str, Any]) -> None:
@@ -1403,29 +1674,56 @@ def _persist_eval_artifacts(
         rule_summary=rule_summary,
         replay_pool=replay_pool,
     )
-    # 默认拿 current active 参与 champion 判断；候选必须先通过 dev 对比才可替换它。
+    # 默认拿 current active 参与 champion 判断；候选必须同时通过 dev 增益和逐样本回归门。
     promotion_candidate = candidate_summary
     promotion_snapshot = snapshot
     best_variant = bundle.get("best_variant") if isinstance(bundle.get("best_variant"), dict) else {}
+    current_dev_summary = bundle.get("current_dev_summary") if isinstance(bundle.get("current_dev_summary"), dict) else {}
     best_dev_summary = bundle.get("best_dev_summary") if isinstance(bundle.get("best_dev_summary"), dict) else {}
     best_test_summary = bundle.get("best_test_summary") if isinstance(bundle.get("best_test_summary"), dict) else {}
-    # dev gate 要求平均分至少提升 0.01，且总硬失败不能增加。
-    candidate_beats_current = bool(
-        best_dev_summary
-        and float(best_dev_summary.get("average_score", 0.0) or 0.0)
-        >= float(candidate_summary.get("average_score", 0.0) or 0.0) + DEFAULT_MIN_SCORE_DELTA
-        and int(best_dev_summary.get("hard_failures", 0) or 0) <= int(candidate_summary.get("hard_failures", 0) or 0)
+    regression = bundle.get("regression") if isinstance(bundle.get("regression"), dict) else {}
+    # dev 只和同一批 mutate_dev 的 current active 对比，避免跨 split 的平均分失真。
+    candidate_gate = _candidate_governance_gate(
+        current_dev_summary=current_dev_summary,
+        candidate_dev_summary=best_dev_summary,
+        candidate_test_summary=best_test_summary,
+        regression=regression,
     )
-    if best_variant and best_test_summary and candidate_beats_current:
-        # 候选通过 dev gate 后，晋级时只使用隔离 promotion_test 的结果。
+    candidate_selected = bool(best_variant and candidate_gate["selected_for_promotion"])
+    best_proposal_id = str(best_variant.get("proposal_id") or "") if candidate_selected else ""
+    if candidate_selected:
+        # 候选通过双锚点治理后，晋级时只使用隔离 promotion_test 的结果。
         promotion_candidate = dict(best_test_summary)
         promotion_snapshot = best_variant.get("snapshot") if isinstance(best_variant.get("snapshot"), dict) else snapshot
     champion_before = _load_champion(lineage_id)
+    # Staged proposal 尚未被 active 调用，因此它用候选质量门替代 active usage gate；
+    # 普通 heuristic/LLM candidate 仍沿用原 status 约束。
+    promotion_status = "healthy" if best_proposal_id else status
     promotion = _promotion_decision(
-        status=status,
+        status=promotion_status,
         candidate=promotion_candidate,
         champion=champion_before,
     )
+    promotion["candidate_gate"] = candidate_gate
+    summaries_by_variant = {
+        str(item.get("variant_id") or ""): item
+        for item in list(bundle.get("variant_summaries") or [])
+        if isinstance(item, dict)
+    }
+    for variant in list(bundle.get("candidate_variants") or []):
+        if not isinstance(variant, dict):
+            continue
+        proposal_id = str(variant.get("proposal_id") or "")
+        if proposal_id:
+            update_skill_proposal(
+                proposal_id,
+                status="evaluated",
+                evaluation={
+                    "run_id": run_id,
+                    "summary": summaries_by_variant.get(str(variant.get("variant_id") or ""), {}),
+                    "candidate_gate": candidate_gate if proposal_id == best_proposal_id else {},
+                },
+            )
     if promotion.get("promoted"):
         # 这里只写 online-eval/champions，不会覆盖 discover_skills() 加载的 active 文件。
         _set_champion(
@@ -1436,9 +1734,20 @@ def _persist_eval_artifacts(
                 "snapshot": promotion_snapshot,
                 "summary": promotion_candidate,
                 "promotion": promotion,
+                "source_proposal_id": best_proposal_id,
                 "updated_at": _utc_now(),
             },
         )
+        if best_proposal_id:
+            update_skill_proposal(
+                best_proposal_id,
+                status="champion",
+                evaluation={
+                    "run_id": run_id,
+                    "summary": promotion_candidate,
+                    "candidate_gate": candidate_gate,
+                },
+            )
 
     summary = {
         "run_id": run_id,
@@ -1458,6 +1767,8 @@ def _persist_eval_artifacts(
         ],
         "variant_summaries": list(bundle.get("variant_summaries") or []),
         "best_candidate": dict(bundle.get("best_dev_summary") or {}),
+        "source_proposal_id": best_proposal_id,
+        "candidate_governance": candidate_gate,
         "promotion": promotion,
         "replay_counts": {
             "total": len(replay_pool),
@@ -1503,9 +1814,16 @@ async def _evaluate_online_skill_evolution_core(
     usage_stats = _read_json(root / SKILL_USAGE_STATS, {})
     lifecycle_stats = load_skill_stats()
     active_skills = _active_skill_snapshots()
+    proposals = load_skill_proposals()
+    proposals_by_skill: dict[str, list[dict[str, Any]]] = {}
+    for proposal in proposals:
+        skill = str(proposal.get("skill") or "").strip()
+        if skill:
+            proposals_by_skill.setdefault(skill, []).append(proposal)
     grouped_rows = _rows_by_skill(provenance_rows)
 
-    action_counts = {"none": 0, "add": 0, "merge": 0, "discard": 0, "failed": 0, "denied": 0, "other": 0}
+    action_counts = {"none": 0, "add": 0, "merge": 0, "propose": 0, "publish": 0, "discard": 0, "failed": 0, "denied": 0, "other": 0}
+    attribution_counts = {"skill_gap": 0, "capability_limit": 0, "evaluation_noise": 0, "unknown": 0}
     ok_count = 0
     candidate_events = 0
     accepted_events = 0
@@ -1515,11 +1833,17 @@ async def _evaluate_online_skill_evolution_core(
         action = str(row.get("action") or "none")
         bucket = _action_bucket(action)
         action_counts[bucket] = int(action_counts.get(bucket, 0)) + 1
+        result = row.get("result") if isinstance(row.get("result"), dict) else {}
+        attribution = result.get("attribution") if isinstance(result.get("attribution"), dict) else {}
+        root_cause = str(attribution.get("root_cause") or "unknown")
+        if root_cause not in attribution_counts:
+            root_cause = "unknown"
+        attribution_counts[root_cause] = int(attribution_counts.get(root_cause, 0)) + 1
         if row.get("ok"):
             ok_count += 1
         if bucket not in {"none", "failed", "denied"}:
             candidate_events += 1
-        if bucket in {"add", "merge"} and row.get("ok"):
+        if bucket in {"add", "merge", "propose"} and row.get("ok"):
             accepted_events += 1
         if bucket in {"failed", "denied"} or row.get("error"):
             recent_failures.append(
@@ -1538,6 +1862,7 @@ async def _evaluate_online_skill_evolution_core(
     if isinstance(usage_stats, dict):
         all_names.update(str(name) for name in usage_stats if str(name).strip())
     all_names.update(str(name) for name in lifecycle_stats if str(name).strip())
+    all_names.update(proposals_by_skill)
 
     skills: list[dict[str, Any]] = []
     for name in sorted(all_names):
@@ -1550,17 +1875,42 @@ async def _evaluate_online_skill_evolution_core(
         lifecycle = lifecycle_raw if isinstance(lifecycle_raw, dict) else {}
         snapshot = active_skills.get(name, {})
         if not snapshot:
-            # active SKILL.md 不存在时构造降级快照，使 lineage 不会从报告中消失。
-            snapshot = {
+            pending = [
+                proposal
+                for proposal in proposals_by_skill.get(name, [])
+                if str(proposal.get("status") or "") in {"pending", "evaluated", "champion"}
+            ]
+            latest_proposal = pending[-1] if pending else {}
+            proposal_snapshot = latest_proposal.get("snapshot") if isinstance(latest_proposal.get("snapshot"), dict) else {}
+            # 新 Skill 尚无 active 时，用 proposal 规则定义评测目标，但仍不会被 Runtime 加载。
+            snapshot = dict(proposal_snapshot) if proposal_snapshot else {
                 "name": name,
                 "description": str(lineage.get("description") or lifecycle.get("description") or ""),
                 "when_to_use": str(lineage.get("when_to_use") or ""),
                 "instructions": "",
             }
+        snapshot["active_exists"] = name in active_skills
 
-        # provenance 负责提供真实 replay，active snapshot 负责提供当前评测规则。
+        # replay 要同时守住 active 约束并验证最新 proposal 的新增约束；candidate 本身仍隔离试跑。
         replay_pool = _build_replay_pool(name, grouped_rows.get(name, []), lineage, freeze=write_artifacts)
-        rules = _compile_eval_rules(snapshot, include_llm_rules=include_llm_rules)
+        eligible_proposals = [
+            proposal
+            for proposal in proposals_by_skill.get(name, [])
+            if str(proposal.get("status") or "") in {"pending", "evaluated"}
+        ]
+        eval_snapshot = dict(snapshot)
+        if eligible_proposals and name in active_skills:
+            latest = eligible_proposals[-1]
+            proposed = latest.get("snapshot") if isinstance(latest.get("snapshot"), dict) else {}
+            proposed_instructions = str(proposed.get("instructions") or "").strip()
+            active_instructions = str(snapshot.get("instructions") or "").strip()
+            if proposed_instructions and proposed_instructions != active_instructions:
+                eval_snapshot["instructions"] = (
+                    active_instructions
+                    + "\n\n## Candidate requirements under evaluation\n\n"
+                    + proposed_instructions
+                ).strip()
+        rules = _compile_eval_rules(eval_snapshot, include_llm_rules=include_llm_rules)
         # 每条 replay 的历史 assistant 回复都要执行全部已编译规则。
         rule_summary = await _summarize_rule_outcomes_async(
             rules,
@@ -1610,6 +1960,10 @@ async def _evaluate_online_skill_evolution_core(
             rules=rules,
             rule_summary=rule_summary,
             side_query=side_query,
+            proposal_variants=_proposal_candidate_variants(
+                skill_name=name,
+                proposals=proposals_by_skill.get(name, []),
+            ),
         )
         # write_artifacts=False 是纯读取模式：不固化 replay、run 或 champion。
         artifacts = (
@@ -1659,7 +2013,16 @@ async def _evaluate_online_skill_evolution_core(
                     "candidate_count": len(list(candidate_bundle.get("candidate_variants") or [])) if isinstance(candidate_bundle, dict) else 0,
                     "best_candidate": dict(candidate_bundle.get("best_dev_summary") or {}) if isinstance(candidate_bundle, dict) else {},
                     "has_promotion_test_eval": bool((candidate_bundle or {}).get("best_test_summary")) if isinstance(candidate_bundle, dict) else False,
+                    "regression": dict(candidate_bundle.get("regression") or {}) if isinstance(candidate_bundle, dict) else {},
                 },
+                "proposals": [
+                    {
+                        "proposal_id": proposal.get("proposal_id", ""),
+                        "status": proposal.get("status", ""),
+                        "requested_action": proposal.get("requested_action", ""),
+                    }
+                    for proposal in proposals_by_skill.get(name, [])
+                ],
                 "artifacts": artifacts,
                 "file": lifecycle.get("file", ""),
                 "skill_dir": snapshot.get("skill_dir", ""),
@@ -1675,6 +2038,9 @@ async def _evaluate_online_skill_evolution_core(
     total_llm_rule_outcomes = 0
     total_llm_rule_passed = 0
     total_candidate_variants = 0
+    total_regression_anchors = 0
+    total_regressions = 0
+    total_hard_regressions = 0
     # 单 Skill 结果完成后再汇总全局状态、规则、LLM judge 和候选数量。
     for item in skills:
         status = str(item.get("status") or "unknown")
@@ -1694,6 +2060,10 @@ async def _evaluate_online_skill_evolution_core(
         total_llm_rule_passed += round(float(eval_data.get("llm_pass_rate", 0.0) or 0.0) * llm_outcome_count)
         candidate_eval = item.get("candidate_eval") if isinstance(item.get("candidate_eval"), dict) else {}
         total_candidate_variants += int(candidate_eval.get("candidate_count", 0) or 0)
+        regression = candidate_eval.get("regression") if isinstance(candidate_eval.get("regression"), dict) else {}
+        total_regression_anchors += int(regression.get("baseline_passed", 0) or 0)
+        total_regressions += int(regression.get("regressed", 0) or 0)
+        total_hard_regressions += int(regression.get("hard_regressions", 0) or 0)
 
     # 顶层 report 同时服务 JSON 审计和 format_online_skill_eval 的终端摘要。
     report = {
@@ -1703,9 +2073,11 @@ async def _evaluate_online_skill_evolution_core(
         "methodology": {
             "lineage": "group online provenance and usage by skill",
             "replay": "freeze compact online conversation windows as replay samples",
-            "rules": "compile deterministic rules and optional LLM judge rules from each active skill's description and instructions",
+            "rules": "compile deterministic and optional LLM rules from active requirements plus the latest staged proposal",
+            "attribution": "classify feedback as skill_gap, capability_limit, or evaluation_noise before any Skill mutation",
             "gate": "mark skills incubating, watch, healthy, pruned, or unobserved from replay, rule, and usage signals",
-            "champion": "promote the current active version into a local online-eval champion only when it is healthy and beats the prior champion gate",
+            "governance": "select on mutate_dev, block per-sample regressions against current active on promotion_test, then compare with the prior champion",
+            "champion": "promote a governed candidate into a local online-eval champion without overwriting active SKILL.md",
         },
         "llm_judge": {
             "enabled": bool(side_query),
@@ -1719,6 +2091,7 @@ async def _evaluate_online_skill_evolution_core(
             "min_invocations": min_invocations,
             "min_relevance_rate": min_relevance_rate,
             "min_rule_pass_rate": min_rule_pass_rate,
+            "max_regression_rate": DEFAULT_MAX_REGRESSION_RATE,
         },
         "aggregate": {
             "online_ingests": len(provenance_rows),
@@ -1728,6 +2101,11 @@ async def _evaluate_online_skill_evolution_core(
             "accepted_events": accepted_events,
             "acceptance_rate": _ratio(accepted_events, candidate_events),
             "actions": action_counts,
+            "attributions": attribution_counts,
+            "proposals": {
+                status: sum(1 for proposal in proposals if str(proposal.get("status") or "") == status)
+                for status in sorted({str(proposal.get("status") or "unknown") for proposal in proposals})
+            },
             "skills": len(skills),
             "statuses": status_counts,
             "champion_statuses": champion_status_counts,
@@ -1738,6 +2116,10 @@ async def _evaluate_online_skill_evolution_core(
             "llm_rule_outcomes": total_llm_rule_outcomes,
             "llm_rule_pass_rate": _ratio(total_llm_rule_passed, total_llm_rule_outcomes),
             "candidate_variants": total_candidate_variants,
+            "regression_anchors": total_regression_anchors,
+            "regressions": total_regressions,
+            "hard_regressions": total_hard_regressions,
+            "regression_rate": _ratio(total_regressions, total_regression_anchors),
         },
         "skills": skills,
         "recent_failures": recent_failures[-10:],
@@ -1837,6 +2219,7 @@ def format_online_skill_eval(report: dict[str, Any] | None = None) -> str:
     report = report or evaluate_online_skill_evolution()
     aggregate = report.get("aggregate") if isinstance(report.get("aggregate"), dict) else {}
     actions = aggregate.get("actions") if isinstance(aggregate.get("actions"), dict) else {}
+    attributions = aggregate.get("attributions") if isinstance(aggregate.get("attributions"), dict) else {}
     statuses = aggregate.get("statuses") if isinstance(aggregate.get("statuses"), dict) else {}
     champion_statuses = aggregate.get("champion_statuses") if isinstance(aggregate.get("champion_statuses"), dict) else {}
     llm_judge = report.get("llm_judge") if isinstance(report.get("llm_judge"), dict) else {}
@@ -1857,15 +2240,30 @@ def format_online_skill_eval(report: dict[str, Any] | None = None) -> str:
             f"llm_rules={aggregate.get('llm_rules', 0)}, "
             f"llm_judgments={aggregate.get('llm_rule_outcomes', 0)}, "
             f"llm_pass_rate={_pct(float(aggregate.get('llm_rule_pass_rate', 0) or 0))}, "
-            f"candidates={aggregate.get('candidate_variants', 0)}"
+            f"candidates={aggregate.get('candidate_variants', 0)}, "
+            f"regression={aggregate.get('regressions', 0)}/{aggregate.get('regression_anchors', 0)} "
+            f"({_pct(float(aggregate.get('regression_rate', 0) or 0))}), "
+            f"hard_regressions={aggregate.get('hard_regressions', 0)}"
         ),
         (
             "  actions: "
-            f"none={actions.get('none', 0)}, add={actions.get('add', 0)}, "
+            f"none={actions.get('none', 0)}, propose={actions.get('propose', 0)}, "
+            f"publish={actions.get('publish', 0)}, add={actions.get('add', 0)}, "
             f"merge={actions.get('merge', 0)}, discard={actions.get('discard', 0)}, "
             f"failed={actions.get('failed', 0)}, denied={actions.get('denied', 0)}"
         ),
     ]
+    if attributions:
+        lines.append(
+            "  attributions: "
+            f"skill_gap={attributions.get('skill_gap', 0)}, "
+            f"capability_limit={attributions.get('capability_limit', 0)}, "
+            f"evaluation_noise={attributions.get('evaluation_noise', 0)}, "
+            f"unknown={attributions.get('unknown', 0)}"
+        )
+    proposals = aggregate.get("proposals") if isinstance(aggregate.get("proposals"), dict) else {}
+    if proposals:
+        lines.append("  proposals: " + ", ".join(f"{key}={proposals[key]}" for key in sorted(proposals)))
     if statuses:
         lines.append("  statuses: " + ", ".join(f"{key}={statuses[key]}" for key in sorted(statuses)))
     if champion_statuses:
@@ -1889,7 +2287,9 @@ def format_online_skill_eval(report: dict[str, Any] | None = None) -> str:
             replay = item.get("replay") if isinstance(item.get("replay"), dict) else {}
             eval_data = item.get("eval") if isinstance(item.get("eval"), dict) else {}
             candidate_eval = item.get("candidate_eval") if isinstance(item.get("candidate_eval"), dict) else {}
+            item_proposals = item.get("proposals") if isinstance(item.get("proposals"), list) else []
             best_candidate = candidate_eval.get("best_candidate") if isinstance(candidate_eval.get("best_candidate"), dict) else {}
+            regression = candidate_eval.get("regression") if isinstance(candidate_eval.get("regression"), dict) else {}
             artifacts = item.get("artifacts") if isinstance(item.get("artifacts"), dict) else {}
             promotion = artifacts.get("promotion") if isinstance(artifacts.get("promotion"), dict) else {}
             reasons = "; ".join(str(reason) for reason in item.get("reasons", []) if str(reason).strip())
@@ -1909,7 +2309,10 @@ def format_online_skill_eval(report: dict[str, Any] | None = None) -> str:
                 f"llm_rules={eval_data.get('llm_rule_count', 0)}, "
                 f"llm_judgments={eval_data.get('llm_outcome_count', 0)}, "
                 f"candidates={candidate_eval.get('candidate_count', 0)}, "
+                f"proposals={len(item_proposals)}, "
                 f"best_candidate_score={float(best_candidate.get('average_score', 0.0) or 0.0):.2f}, "
+                f"regression={_pct(float(regression.get('regression_rate', 0.0) or 0.0))}, "
+                f"hard_regressions={regression.get('hard_regressions', 0)}, "
                 f"rule_pass={_pct(float(eval_data.get('pass_rate', 0) or 0))}, "
                 f"hard_failures={eval_data.get('hard_failures', 0)}, "
                 f"retrieved={item.get('retrieved', 0)}, "

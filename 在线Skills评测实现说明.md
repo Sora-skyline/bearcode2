@@ -11,25 +11,32 @@ agents/online_skill_eval.py
 REPL 命令入口：
 
 ```text
+/skill-proposals
 /skill-eval
+/skill-promote <skill-name>
 ```
 
-当前评测会做观察、规则评估、候选变体试跑和记录。它可以调用 LLM 判断某条规则是否满足，也可以为候选变体重新生成 replay 回复做对比评测；但不会自动覆盖、删除或归档当前 active `SKILL.md`。
+当前链路会管理在线 proposal、做规则评估与候选试跑，并记录 champion。它可以调用 LLM 判断某条规则是否满足，也可以为候选变体重新生成 replay 回复做对比评测；评测本身不会覆盖 active `SKILL.md`，只有用户显式执行 `/skill-promote` 才发布已过门禁的 champion。
 
 ## 0. 评测整体思路
 
-在线 Skills 评测的核心思路不是直接问“这个 Skill 写得好不好”，而是先看它在真实使用里有没有足够证据，再用规则判断历史回复是否符合 Skill 要求；如果发现失败规则，会生成候选改进版本重新试跑，最后只在证据足够时记录 champion。
+在线 Skills 评测的核心思路不是直接问“这个 Skill 写得好不好”，而是把 `skill_gap` 产生的 add / merge 先保存为隔离 proposal，再看它有没有足够真实证据。proposal 与其他候选必须在 dev 提升、promotion-test 质量达标且不回归，并继续优于历史 champion，才会被记录为 champion。
 
 它大致按下面的顺序工作：
 
 ```text
 先确认有哪些 Skill 需要观察
   -> 找到这些 Skill 的真实对话来源
+  -> 把 pending / evaluated proposal 放入候选池
   -> 把历史对话整理成可复查的样本
   -> 从 Skill 文档里提取可检查的要求
   -> 检查历史回复是否满足这些要求
   -> 根据失败规则生成候选改进版本
-  -> 用候选版本重新生成回复并评测
+  -> 用候选版本重新生成回复并在 dev 选优
+  -> 在 promotion-test 逐样本对比 current active
+  -> 再与历史 champion 比较
+  -> 通过后只记录 champion
+  -> 用户显式 /skill-promote 才发布 active
   -> 再看这个 Skill 后续有没有被检索、相关、实际使用
   -> 最后给出观察状态和原因
 ```
@@ -40,7 +47,8 @@ REPL 命令入口：
 - 如果已经有一些使用信号，但样本太少，还不能说明稳定，就会先放在观察期。
 - 如果历史回复未通过规则，会生成候选变体，并用 replay 重新生成候选回复做对比。
 - 如果样本数量、规则通过情况、后续使用情况都达标，才会被认为比较健康。
-- 如果候选变体明显优于当前版本，并且满足 promotion gate，才可能被记录为 champion 产物；当前代码仍不会自动改写 active Skill 文件。
+- 如果候选变体在同一 dev 样本上优于当前版本、promotion-test 零回归且满足历史 champion gate，才可能被记录为 champion 产物；当前代码仍不会自动改写 active Skill 文件。
+- `/skill-promote <skill>` 只接受已通过 promotion gate 的 champion；没有 champion 或门禁未通过时拒绝发布。
 
 后文会使用一些实现名词。可以先这样理解：
 
@@ -50,7 +58,9 @@ REPL 命令入口：
 | `lineage` | 某一个 Skill 的完整观察主线 |
 | `rule` | 从 Skill 文档里提取出来的检查要求 |
 | `LLM judge` | 让模型判断某条回复是否满足一条规则 |
+| `RegR` | current active 已通过、candidate 却失败的样本/规则比例 |
 | `champion` | 当前本地记录里表现最好的健康版本 |
+| `proposal` | 在线反馈产生、尚未影响 Runtime 行为的隔离 Skill 候选 |
 
 ## 1. 总体架构
 
@@ -68,24 +78,31 @@ REPL 命令入口：
 
 ```text
 /skill-eval 或模块运行
-  -> 读取 online provenance / usage / active skills
+  -> 读取 online provenance / usage / active skills / proposals
   -> 按 Skill 名称形成 lineage
   -> 构造并固化 replay pool
   -> 从 SKILL.md 编译 programmatic / llm_binary 规则
   -> 对历史 latest_assistant 执行规则评测
-  -> 基于失败规则生成候选变体
-  -> 用候选变体重新生成 replay 回复并评测
+  -> 合并 online proposal、heuristic 和 LLM 候选变体
+  -> 用候选变体重新生成 replay 回复并在 mutate_dev 选优
+  -> 在 promotion_test 逐 sample_id + rule_id 检查回归
   -> 合并 retrieved / surfaced / invoked / inferred_used
   -> 计算 status
-  -> 判断 champion promotion
+  -> 与历史 champion 比较并判断 promotion
   -> 写出 report 和 run artifacts
+
+/skill-promote <skill>
+  -> 读取该 lineage 已过门禁 champion
+  -> create 或 evolve active SKILL.md
+  -> proposal 状态更新为 published
 ```
 
-这里有三个核心判断：
+这里有四个核心判断：
 
 - 这个 Skill 有没有真实在线证据。
 - 这个 Skill 的历史回复是否满足自身规则。
 - 这个 Skill 后续是否真的被检索、相关、使用。
+- 候选的平均分提升是否以牺牲 current active 已通过的能力为代价。
 
 ## 2. 入口与运行路径
 
@@ -157,7 +174,7 @@ evaluate_online_skill_evolution(
 
 `usage stats` 是使用统计。它回答“这个 Skill 后续有没有被检索出来、是否相关、是否真的被使用”。
 
-`active Skill` 是当前能被系统加载到的 `SKILL.md`。评测规则主要从 active Skill 的文本里编译。
+`active Skill` 是当前能被系统加载到的 `SKILL.md`。对于已有 active 的 merge proposal，评测规则同时覆盖 active 约束和最新 proposal 的新增约束；对于尚无 active 的 add proposal，直接从 proposal 快照编译目标规则。
 
 ### 3.2 当前代码读取什么
 
@@ -176,6 +193,9 @@ evaluate_online_skill_evolution(
 | `skill_usage_stats.json` | Skill 的 retrieved、surfaced、invoked 与 inferred_used 分层统计 |
 | `usage.jsonl` | create、invoke、feedback、evolve、prune 等生命周期事件 |
 | `history/*.jsonl` | Skill 演化前快照 |
+| `proposals.json` | proposal 注册表与 pending / evaluated / champion / published 状态 |
+| `proposals/<proposal-id>/proposal.json` | 单个候选的来源、快照和评测摘要 |
+| `proposals/<proposal-id>/SKILL.md` | 可人工审阅但不会被 `discover_skills()` 加载的候选副本 |
 
 评测还会调用：
 
@@ -195,7 +215,8 @@ agents/skills.py::discover_skills()
 这些输入会被拆成三类用途：
 
 - provenance 用来构造 replay 样本。
-- active Skill 文本用来编译规则。
+- active Skill 与最新 proposal 文本共同定义候选治理规则。
+- proposal 快照进入候选试跑，但不会进入 Runtime Skill 发现目录。
 - usage stats 用来做状态门控。
 
 ## 4. Lineage 聚合
@@ -856,7 +877,7 @@ pruned
 
 `champion` 是某条 lineage 当前本地评测记录里的已知健康版本。
 
-它不是发布机制，也不是自动回滚机制。当前实现会把通过门槛的 current active 或候选变体记录下来，作为后续比较参考。
+它不是自动发布或自动回滚机制。当前实现会把通过门槛的 current active 或候选变体记录下来，作为后续比较参考；显式 `/skill-promote` 是独立的发布步骤。
 
 ### 14.2 当前代码怎么做
 
@@ -867,9 +888,10 @@ _promotion_decision()
 _load_champion()
 _set_champion()
 _persist_eval_artifacts()
+publish_online_skill_champion()
 ```
 
-评测会先生成 current active 的评测摘要；如果存在候选变体，并且候选变体在 dev 样本上明显优于 current active 且硬失败不增加，则优先把该候选变体作为 promotion candidate。否则仍使用 current active 作为 promotion candidate。
+评测会先生成 current active 的评测摘要。候选只在 `mutate_dev` 上选优，而且双方严格比较同一批 dev 样本；最优候选随后进入 `promotion_test`，以 `sample_id + rule_id` 为键，统计 current active 已通过但 candidate 失败的项目。默认要求 RegR 为 0 且不能出现硬规则回归，之后候选才有资格与历史 champion 比较。否则仍使用 current active 作为 promotion candidate，并把阻断原因写入 `candidate_governance`。
 
 只有状态为：
 
@@ -883,6 +905,11 @@ healthy
 
 ```text
 candidate.status == healthy
+candidate.dev_score >= current_active.dev_score + DEFAULT_MIN_SCORE_DELTA
+candidate.promotion_test_rule_pass_rate >= DEFAULT_MIN_RULE_PASS_RATE
+candidate.promotion_test_hard_failures == 0
+candidate.regression_rate <= DEFAULT_MAX_REGRESSION_RATE
+candidate.hard_regressions == 0
 candidate.average_score >= champion.average_score + DEFAULT_MIN_SCORE_DELTA
 candidate.hard_failures <= champion.hard_failures
 ```
@@ -891,6 +918,7 @@ candidate.hard_failures <= champion.hard_failures
 
 ```text
 DEFAULT_MIN_SCORE_DELTA = 0.01
+DEFAULT_MAX_REGRESSION_RATE = 0.0
 ```
 
 ### 14.4 产物位置
@@ -984,15 +1012,19 @@ YYYYMMDDTHHMMSSZ-<lineage_id_suffix>
 | `online_ingests` | online ingest 总次数 |
 | `ok` / `ok_rate` | 成功次数和成功率 |
 | `candidate_events` | 出现候选维护动作的次数 |
-| `accepted_events` | 成功 add / merge 的次数 |
+| `accepted_events` | 成功进入 proposal（兼容旧 add / merge）的次数 |
+| `proposals` | 各 proposal 状态的数量 |
 | `acceptance_rate` | 候选接受率 |
 | `actions` | action 分布 |
+| `attributions` | `skill_gap / capability_limit / evaluation_noise / unknown` 分布 |
 | `skills` | 纳入评测的 Skill 数量 |
 | `statuses` | Skill 状态分布 |
 | `champion_statuses` | champion / promotion 状态分布 |
 | `replay_samples` | replay 样本总数 |
 | `rule_outcomes` | 规则判断总数 |
 | `rule_pass_rate` | 全局规则通过率 |
+| `regression_anchors` / `regressions` | current active 已通过的对比项和其中发生回归的数量 |
+| `regression_rate` / `hard_regressions` | 全局 RegR 和硬规则回归数 |
 
 ### 16.5 每个 Skill 的字段
 
@@ -1009,6 +1041,7 @@ YYYYMMDDTHHMMSSZ-<lineage_id_suffix>
 | `relevance_rate` / `inferred_used_rate` | 诊断比例；后者不参与归档或晋级 |
 | `replay` | replay 数量、split、来源 |
 | `eval` | 规则、通过率、失败信息 |
+| `candidate_eval.regression` | 候选逐样本 RegR、硬规则回归和具体失败项 |
 | `artifacts` | dataset、eval spec、run、champion、promotion 信息 |
 | `file` / `skill_dir` | Skill 文件和目录 |
 
@@ -1023,12 +1056,13 @@ YYYYMMDDTHHMMSSZ-<lineage_id_suffix>
 ```text
 Online skill eval:
   data_dir=/path/to/.bear/skill-evolution
-  aggregate: ingests=8, ok_rate=100.0%, candidate_events=1, acceptance_rate=100.0%, replay_samples=1, rule_pass_rate=50.0%, llm=on, llm_rules=4, llm_judgments=1, llm_pass_rate=0.0%, candidates=1
+  aggregate: ingests=8, ok_rate=100.0%, candidate_events=1, acceptance_rate=100.0%, replay_samples=4, rule_pass_rate=75.0%, llm=on, llm_rules=4, llm_judgments=4, llm_pass_rate=75.0%, candidates=1, regression=0/2 (0.0%), hard_regressions=0
   actions: none=7, add=1, merge=0, discard=0, failed=0, denied=0
+  attributions: skill_gap=1, capability_limit=2, evaluation_noise=5, unknown=0
   statuses: incubating=3, unobserved=1
   champion_statuses: incubating=3, unobserved=1
   skills:
-    <skill>: status=incubating, replay=1 (test=0), rules=2, llm_rules=1, llm_judgments=1, candidates=1, best_candidate_score=3.00, rule_pass=50.0%, hard_failures=0, retrieved=2, surfaced=2, invoked=0, inferred_used_rate=50.0%, champion=incubating - only 1 replay sample(s); failures: skill_instruction_alignment: <judge reason>
+    <skill>: status=healthy, replay=4 (test=1), rules=2, llm_rules=1, llm_judgments=4, candidates=1, best_candidate_score=3.00, regression=0.0%, hard_regressions=0, rule_pass=75.0%, hard_failures=0, retrieved=5, surfaced=5, invoked=1, inferred_used_rate=60.0%, champion=active_champion
   report_file=/path/to/online_eval_report.json
 ```
 
@@ -1193,18 +1227,23 @@ incubating=3, unobserved=1
 - LLM judge 二元规则。
 - 基于失败规则的 heuristic candidate variant。
 - LLM candidate variant。
+- online proposal candidate variant。
 - candidate replay response 生成与评测。
+- current-active / candidate 同 split 对比。
+- promotion-test 逐样本回归率和硬回归 gate。
 - usage gate。
 - status gate。
 - run artifacts。
 - 本地 champion 记录与 champion `SKILL.md` 产物。
+- proposal 状态机和显式 champion publish。
 
 ### 18.2 边界总结
 
 ```text
 评测可以调用 LLM 判断规则是否满足，
 也可以为候选变体生成 replay 回复，
-但不会自动覆盖当前 active Skill 文件。
+但不会自动覆盖当前 active Skill 文件；
+只有显式 /skill-promote 才能发布已过门禁 champion。
 ```
 
 ## 19. 总结
@@ -1214,10 +1253,12 @@ incubating=3, unobserved=1
 ```text
 按 Skill 名称形成 lineage，
 从在线 provenance 构造并固化 replay pool，
-从当前 SKILL.md 编译 programmatic 和可选 llm_binary 规则，
+从 active SKILL.md 与最新 proposal 编译 programmatic 和可选 llm_binary 规则，
 评估历史 latest_assistant 是否满足规则，
 基于失败规则生成候选变体并评测 candidate replay 回复，
+在同一 mutate-dev 上选优，并在 promotion-test 逐样本检查回归，
 合并 retrieved / surfaced / invoked / inferred_used 统计，
 根据 replay、规则、usage gate 判断状态，
 写出 report、eval spec、run artifacts、candidate artifacts 和 champion 记录。
+最后由用户显式决定是否把 champion 发布为 active Skill。
 ```

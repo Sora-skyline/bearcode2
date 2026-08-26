@@ -28,6 +28,8 @@ ONLINE_PROVENANCE_LOG = "online_provenance.jsonl"
 ONLINE_PROVENANCE_INDEX = "online_skill_provenance.json"
 SKILL_USAGE_STATS = "skill_usage_stats.json"
 HISTORY_DIR = "history"
+PROPOSALS_INDEX = "proposals.json"
+PROPOSALS_DIR = "proposals"
 
 
 def get_evolution_dir() -> Path:
@@ -225,6 +227,7 @@ def _update_online_provenance_index(row: dict[str, Any]) -> None:
         "ok": row.get("ok"),
         "messages": row.get("messages", []),
         "skill_trace": row.get("skill_trace", {}),
+        "attribution": result.get("attribution", {}),
         "decision": row.get("decision", {}),
         "error": row.get("error", ""),
     }
@@ -333,6 +336,168 @@ def _skill_body(instructions: str, evidence: str = "") -> str:
     if evidence:
         body = body.rstrip() + "\n\n## Creation Evidence\n\n" + str(evidence).strip() + "\n"
     return body.rstrip() + "\n"
+
+
+def _proposal_registry_path() -> Path:
+    return get_evolution_dir() / PROPOSALS_INDEX
+
+
+def load_skill_proposals(
+    *,
+    skill_name: str = "",
+    statuses: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """读取 proposal 注册表，并按 Skill/状态做可选过滤。"""
+    registry = _read_json(_proposal_registry_path(), {"proposals": {}})
+    proposals = registry.get("proposals") if isinstance(registry, dict) else {}
+    if not isinstance(proposals, dict):
+        return []
+    wanted_skill = str(skill_name or "").strip()
+    wanted_statuses = {str(item).strip() for item in statuses or set() if str(item).strip()}
+    items = [dict(item) for item in proposals.values() if isinstance(item, dict)]
+    if wanted_skill:
+        items = [item for item in items if str(item.get("skill") or "") == wanted_skill]
+    if wanted_statuses:
+        items = [item for item in items if str(item.get("status") or "") in wanted_statuses]
+    return sorted(items, key=lambda item: (str(item.get("created_at") or ""), str(item.get("proposal_id") or "")))
+
+
+def stage_skill_proposal(
+    *,
+    skill_name: str,
+    requested_action: str,
+    snapshot: dict[str, Any],
+    target: str = "project",
+    evidence: str = "",
+    rationale: str = "",
+    attribution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """保存不影响 Runtime 的候选 Skill，等待 replay 评测和显式发布。"""
+    resolved_name = str(skill_name or snapshot.get("name") or "").strip()
+    action = str(requested_action or "").strip().lower()
+    if not resolved_name:
+        return {"ok": False, "error": "proposal skill name is required"}
+    if action not in {"add", "merge"}:
+        return {"ok": False, "error": f"unsupported proposal action: {action}"}
+    instructions = str(snapshot.get("instructions") or "").strip()
+    description = str(snapshot.get("description") or "").strip()
+    if not instructions or not description:
+        return {"ok": False, "error": "proposal description and instructions are required"}
+
+    created_at = _utc_now()
+    proposal_hash = hashlib.sha1(
+        json.dumps(
+            {
+                "skill": resolved_name,
+                "action": action,
+                "snapshot": snapshot,
+                "time_ns": time.time_ns(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+    proposal_id = f"proposal-{proposal_hash}"
+    proposal_dir = get_evolution_dir() / PROPOSALS_DIR / proposal_id
+    proposal = {
+        "proposal_id": proposal_id,
+        "skill": resolved_name,
+        "requested_action": action,
+        "status": "pending",
+        "target": "user" if str(target or "").strip().lower() == "user" else "project",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "evidence": _preview(evidence, 2000),
+        "rationale": _preview(rationale, 2000),
+        "attribution": dict(attribution or {}),
+        "snapshot": {
+            "name": resolved_name,
+            "description": description,
+            "when_to_use": str(snapshot.get("when_to_use") or "").strip(),
+            "instructions": instructions,
+            "context": _normalize_context(str(snapshot.get("context") or "inline")),
+            "user_invocable": bool(snapshot.get("user_invocable", False)),
+            "source": str(snapshot.get("source") or target or "project").strip().lower(),
+            "tags": [str(tag).strip() for tag in list(snapshot.get("tags") or []) if str(tag).strip()][:12],
+        },
+    }
+
+    proposal_dir.mkdir(parents=True, exist_ok=False)
+    _write_json(proposal_dir / "proposal.json", proposal)
+    meta = {
+        "name": resolved_name,
+        "description": description,
+        "proposal-id": proposal_id,
+        "proposal-status": "pending",
+        "context": proposal["snapshot"]["context"],
+        "user-invocable": "true" if proposal["snapshot"]["user_invocable"] else "false",
+    }
+    if proposal["snapshot"]["when_to_use"]:
+        meta["when-to-use"] = proposal["snapshot"]["when_to_use"]
+    (proposal_dir / "SKILL.md").write_text(
+        format_frontmatter(meta, _skill_body(instructions)),
+        encoding="utf-8",
+    )
+
+    registry = _read_json(_proposal_registry_path(), {"version": 1, "proposals": {}})
+    if not isinstance(registry, dict):
+        registry = {"version": 1, "proposals": {}}
+    proposals = registry.setdefault("proposals", {})
+    if not isinstance(proposals, dict):
+        proposals = {}
+        registry["proposals"] = proposals
+    proposals[proposal_id] = proposal
+    _write_json(_proposal_registry_path(), registry)
+    _append_jsonl(
+        get_evolution_dir() / USAGE_LOG,
+        {
+            "event": "propose",
+            "time": created_at,
+            "skill": resolved_name,
+            "proposal_id": proposal_id,
+            "requested_action": action,
+            "file": str(proposal_dir / "SKILL.md"),
+        },
+    )
+    return {
+        "ok": True,
+        "action": "propose",
+        "skill": resolved_name,
+        "proposal_id": proposal_id,
+        "proposal_file": str(proposal_dir / "SKILL.md"),
+        "status": "pending",
+    }
+
+
+def update_skill_proposal(
+    proposal_id: str,
+    *,
+    status: str,
+    evaluation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """更新 proposal 状态和评测摘要，保持 candidate 生命周期可审计。"""
+    wanted = str(proposal_id or "").strip()
+    registry = _read_json(_proposal_registry_path(), {"proposals": {}})
+    proposals = registry.get("proposals") if isinstance(registry, dict) else {}
+    proposal = proposals.get(wanted) if isinstance(proposals, dict) else None
+    if not isinstance(proposal, dict):
+        return {"ok": False, "error": f"proposal not found: {wanted}"}
+    proposal["status"] = str(status or "").strip() or str(proposal.get("status") or "pending")
+    proposal["updated_at"] = _utc_now()
+    if evaluation is not None:
+        previous = proposal.get("evaluation") if isinstance(proposal.get("evaluation"), dict) else {}
+        proposal["evaluation"] = {**previous, **dict(evaluation)}
+    proposals[wanted] = proposal
+    _write_json(_proposal_registry_path(), registry)
+    artifact = get_evolution_dir() / PROPOSALS_DIR / wanted / "proposal.json"
+    _write_json(artifact, proposal)
+    skill_file = artifact.parent / "SKILL.md"
+    if skill_file.is_file():
+        parsed = parse_frontmatter(skill_file.read_text(encoding="utf-8"))
+        meta = dict(parsed.meta)
+        meta["proposal-status"] = proposal["status"]
+        skill_file.write_text(format_frontmatter(meta, parsed.body), encoding="utf-8")
+    return {"ok": True, "proposal_id": wanted, "status": proposal["status"], "skill": proposal.get("skill", "")}
 
 
 def create_skill_file(

@@ -59,6 +59,7 @@ def print_welcome() -> None:
     commands.add_row("/plan", "read-only planning workflow")
     commands.add_row("/skills", "list reusable skills")
     commands.add_row("/skill-create", "create a reusable skill")
+    commands.add_row("/skill-proposals", "review staged skill proposals")
     commands.add_row("/skill-stats", "show skill evolution stats")
     commands.add_row("/memory", "list long-term memories")
     commands.add_row("/compact", "compact current context")

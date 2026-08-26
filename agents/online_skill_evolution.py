@@ -1,11 +1,11 @@
 """从真实对话和下一轮反馈中抽取、维护在线 Skill 候选。
 
-本模块是“决策层”：Extractor 判断是否存在稳定可复用经验，Maintainer 决定 add、merge
-或 discard，``online_ingest`` 编排权限与 provenance。文件写入、历史快照和统计由
+本模块是“决策层”：Attributor / Extractor 先隔离不可修复反馈并提炼稳定经验，Maintainer
+决定 add、merge 或 discard，``online_ingest`` 编排 proposal 与 provenance。文件写入、历史快照和统计由
 ``skill_evolution`` 负责。
 
 完整链路分两次对话完成：本轮回答先进入 pending window，下一轮用户反馈补齐结果证据；
-随后 Extractor 产出候选，Maintainer 与现有 Skill 比较，最后才可能写入。这个延迟窗口
+随后可修复性归因决定是否产出候选，Maintainer 与现有 Skill 比较，最后只写隔离 proposal。这个延迟窗口
 避免仅凭模型自己的回答就把未经用户验证的做法沉淀成长期 Skill。
 """
 
@@ -18,7 +18,6 @@ from typing import Any, Awaitable, Callable
 
 
 SideQuery = Callable[[str, str], Awaitable[str]]
-ConfirmWrite = Callable[[str], Awaitable[bool]]
 
 
 @dataclass
@@ -30,6 +29,16 @@ class OnlineSkillCandidate:
     instructions: str = ""
     evidence: str = ""
     tags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class OnlineFeedbackAnalysis:
+    """反馈的可修复性归因；只有 skill_gap 可以进入 Skill 维护链路。"""
+
+    root_cause: str
+    reason: str = ""
+    evidence: str = ""
+    candidate: OnlineSkillCandidate | None = None
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -94,6 +103,75 @@ def _coerce_candidate(obj: dict[str, Any]) -> OnlineSkillCandidate | None:
     )
 
 
+def _coerce_feedback_analysis(obj: dict[str, Any]) -> OnlineFeedbackAnalysis:
+    """校验联合归因/抽取输出；异常结果保守归为 evaluation_noise。"""
+    allowed = {"skill_gap", "capability_limit", "evaluation_noise"}
+    root_cause = str(obj.get("root_cause") or "").strip().lower()
+    if root_cause not in allowed:
+        root_cause = "evaluation_noise"
+
+    candidate = None
+    skills = obj.get("skills")
+    if root_cause == "skill_gap" and isinstance(skills, list) and skills and isinstance(skills[0], dict):
+        candidate = _coerce_candidate(skills[0])
+
+    return OnlineFeedbackAnalysis(
+        root_cause=root_cause,
+        reason=str(obj.get("reason") or "").strip(),
+        evidence=str(obj.get("evidence") or "").strip(),
+        candidate=candidate,
+    )
+
+
+def _attribution_payload(analysis: OnlineFeedbackAnalysis) -> dict[str, str]:
+    """返回适合 provenance/report 的紧凑归因，不重复保存候选正文。"""
+    return {
+        "root_cause": analysis.root_cause,
+        "reason": analysis.reason,
+        "evidence": analysis.evidence,
+    }
+
+
+async def analyze_online_feedback(
+    *,
+    messages: list[dict[str, Any]],
+    side_query: SideQuery,
+    skill_trace: dict[str, Any] | None = None,
+    hint: str = "",
+) -> OnlineFeedbackAnalysis:
+    """联合完成反馈归因和候选抽取，避免不可修复失败污染 Skill。"""
+    system = (
+        "You are Bear Code's online Skill Feedback Attributor and Extractor.\n"
+        "First classify whether the observed feedback is repairable by changing reusable Skill guidance.\n"
+        "Then extract at most ONE candidate only for a skill_gap.\n"
+        "Output ONLY strict JSON.\n\n"
+        "Schema:\n"
+        '{"root_cause":"skill_gap|capability_limit|evaluation_noise",'
+        '"reason":"short reason","evidence":"short user-grounded evidence","skills":[]}\n\n'
+        "Root-cause rules:\n"
+        "- skill_gap: missing or incorrect durable workflow, policy, implementation preference, or output constraint that changing a Skill can fix.\n"
+        "- capability_limit: missing tool, permission, network, sandbox, runtime, model capability, or infrastructure support; Skill text cannot fix it.\n"
+        "- evaluation_noise: no clear failure or durable correction, contradictory/ambiguous feedback, or insufficient user evidence.\n\n"
+        "Candidate fields: name, description, when_to_use, instructions, evidence, tags.\n\n"
+        "Extraction rules:\n"
+        "- USER turns are the primary evidence. Assistant turns are context only.\n"
+        "- A next user feedback turn may confirm, reject, or refine the prior assistant behavior.\n"
+        "- For capability_limit or evaluation_noise, skills MUST be [].\n"
+        "- Do not extract assistant-only guesses, weak confirmations, one-off task payload, secrets, project facts, URLs, account IDs, exact dates, or temporary parameters.\n"
+        "- Extract only durable guidance likely useful for future similar tasks.\n"
+        "- Remove entity names and runtime-specific payload; use placeholders where needed.\n"
+        "- skill_trace is identity context only; never treat retrieved, surfaced, or invoked metadata as new user evidence.\n"
+        "- If evidence is weak, generic, or low-value, classify evaluation_noise and return skills=[].\n"
+    )
+    payload = {
+        "messages": messages,
+        "hint": hint,
+        "skill_trace": skill_trace or None,
+    }
+    parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
+    return _coerce_feedback_analysis(parsed)
+
+
 async def extract_online_skill_candidate(
     *,
     messages: list[dict[str, Any]],
@@ -101,36 +179,14 @@ async def extract_online_skill_candidate(
     skill_trace: dict[str, Any] | None = None,
     hint: str = "",
 ) -> OnlineSkillCandidate | None:
-    """让 side query 从“任务、回答、下一轮反馈”中抽取耐久且可复用的 Skill。"""
-    system = (
-        "You are Bear Code's online Skill Extractor.\n"
-        "Extract at most ONE reusable skill candidate from a live conversation window.\n"
-        "Output ONLY strict JSON: {\"skills\": []} or {\"skills\": [{...}]}.\n\n"
-        "Candidate fields: name, description, when_to_use, instructions, evidence, tags.\n\n"
-        "Rules:\n"
-        "- USER turns are the primary evidence. Assistant turns are context only.\n"
-        "- A next user feedback turn may confirm, reject, or refine the prior assistant behavior.\n"
-        "- Do not extract assistant-only guesses, weak confirmations, one-off task payload, secrets, project facts, URLs, account IDs, exact dates, or temporary parameters.\n"
-        "- Extract only durable workflow, output policy, implementation preference, correction, or repeated constraint likely useful for future similar tasks.\n"
-        "- Remove entity names and runtime-specific payload; use placeholders where needed.\n"
-        "- skill_trace is identity context only; never treat retrieved, surfaced, or invoked metadata as new user evidence.\n"
-        "- If evidence is weak, generic, or low-value, return {\"skills\": []}.\n"
+    """兼容旧调用方：归因完成后只返回可修复的 Skill 候选。"""
+    analysis = await analyze_online_feedback(
+        messages=messages,
+        side_query=side_query,
+        skill_trace=skill_trace,
+        hint=hint,
     )
-    payload = {
-        # Skill trace 只帮助识别“是否在改已有 Skill”，不能替代真实用户证据。
-        "messages": messages,
-        "hint": hint,
-        "skill_trace": skill_trace or None,
-    }
-    # 解析失败或空 skills 都按“没有可靠候选”处理，不让不稳定输出触发落盘。
-    parsed = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
-    skills = parsed.get("skills")
-    if not isinstance(skills, list) or not skills:
-        return None
-    first = skills[0]
-    if not isinstance(first, dict):
-        return None
-    return _coerce_candidate(first)
+    return analysis.candidate
 
 
 def _exact_identity_match(candidate: OnlineSkillCandidate, skills: list[Any]) -> str:
@@ -158,14 +214,16 @@ async def maintain_online_skill_candidate(
     candidate: OnlineSkillCandidate,
     side_query: SideQuery,
     skill_trace: dict[str, Any] | None = None,
-    confirm_write: ConfirmWrite | None = None,
     target: str = "project",
+    attribution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """比较候选与现有 Skills，返回 add、merge 或 discard 的维护决策。"""
-    from .skills import create_skill, discover_skills, evolve_skill, retrieve_relevant_skills
+    """比较候选与现有 Skills，并把 add/merge 决策保存为待评测 proposal。"""
+    from .skill_evolution import stage_skill_proposal
+    from .skills import discover_skills, retrieve_relevant_skills
 
     # 先做确定性身份匹配，再把相似检索结果交给 Maintainer，降低重复 Skill 概率。
     skills = discover_skills() # 加载现有 Skills
+    skills_by_name = {str(getattr(skill, "name", "") or "").strip(): skill for skill in skills}
     exact_target = _exact_identity_match(candidate, skills)# 精确身份匹配
     similar_hits = retrieve_relevant_skills(_candidate_search_text(candidate), limit=8, min_score=0.03)# 相似 Skill 检索
     existing_names = {str(getattr(skill, "name", "") or "").strip() for skill in skills}
@@ -210,7 +268,7 @@ async def maintain_online_skill_candidate(
         ],
     }
 
-    # LLM 只提出集合维护决策，下面仍会用确定性规则修正并经过权限确认。
+    # LLM 只提出集合维护决策，下面仍会用确定性规则修正并保存为隔离 proposal。
     decision = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
     action = str(decision.get("action") or "").strip().lower()
     target_skill = str(decision.get("target_skill") or "").strip()
@@ -246,47 +304,59 @@ async def maintain_online_skill_candidate(
     if action == "discard":
         return {"ok": True, "action": "discard", "skill": "", "decision": decision}
 
-    write_summary = f"online skill evolution: {action} {target_skill or candidate.name}"
-    # Maintainer 只给建议；真正 add/merge 前仍需通过 Runtime 提供的写权限回调。
-    if confirm_write is not None and not await confirm_write(write_summary):
-        return {
-            "ok": False,
-            "action": f"{action}_denied",
-            "skill": target_skill or candidate.name,
-            "error": "permission denied",
-            "decision": decision,
-        }
-
+    # Proposal 只是隔离评测产物，不改变 Runtime 行为；写权限留到显式 publish 阶段。
     if action == "merge":
         if not target_skill:
             return {"ok": False, "action": "merge", "error": "missing target_skill", "decision": decision}
-        # merge 委托持久化层保存旧快照并提升版本，不做无历史覆盖。
-        result = evolve_skill(
+        existing = skills_by_name[target_skill]
+        existing_instructions = str(getattr(existing, "prompt_template", "") or "").strip()
+        merged_instructions = str(decision.get("merged_instructions") or "").strip()
+        if not merged_instructions:
+            addition = candidate.instructions.strip()
+            merged_instructions = existing_instructions
+            if addition and addition not in existing_instructions:
+                merged_instructions = (existing_instructions + "\n\n## Proposed Addition\n\n" + addition).strip()
+        snapshot = {
+            "name": target_skill,
+            "description": str(decision.get("merged_description") or getattr(existing, "description", "") or ""),
+            "when_to_use": str(decision.get("merged_when_to_use") or getattr(existing, "when_to_use", "") or ""),
+            "instructions": merged_instructions,
+            "context": str(getattr(existing, "context", "inline") or "inline"),
+            "user_invocable": bool(getattr(existing, "user_invocable", False)),
+            "source": str(getattr(existing, "source", "project") or "project"),
+            "tags": candidate.tags,
+        }
+        result = stage_skill_proposal(
             skill_name=target_skill,
-            lesson=candidate.evidence or candidate.description,
-            rationale=str(decision.get("reason") or "Online maintainer merge"),
-            target="active",
-            instructions=str(decision.get("merged_instructions") or candidate.instructions),
-            description=str(decision.get("merged_description") or ""),
-            when_to_use=str(decision.get("merged_when_to_use") or candidate.when_to_use),
-            tags=candidate.tags,
+            requested_action="merge",
+            snapshot=snapshot,
+            target=snapshot["source"],
+            evidence=candidate.evidence or candidate.description,
+            rationale=str(decision.get("reason") or "Online maintainer merge proposal"),
+            attribution=attribution,
         )
-        return {"action": "merge", "candidate": asdict(candidate), "decision": decision, **result}
+        return {"requested_action": "merge", "candidate": asdict(candidate), "decision": decision, **result}
 
-    # add 默认生成项目级、不可由用户斜杠直接调用的 inline Skill。
-    result = create_skill(
-        name=candidate.name,
-        description=candidate.description,
-        instructions=candidate.instructions,
-        when_to_use=candidate.when_to_use,
+    # add proposal 默认面向项目级、不可由用户斜杠直接调用的 inline Skill。
+    result = stage_skill_proposal(
+        skill_name=candidate.name,
+        requested_action="add",
+        snapshot={
+            "name": candidate.name,
+            "description": candidate.description,
+            "instructions": candidate.instructions,
+            "when_to_use": candidate.when_to_use,
+            "context": "inline",
+            "user_invocable": False,
+            "source": target,
+            "tags": candidate.tags,
+        },
         target=target,
-        context="inline",
-        user_invocable=False,
         evidence=candidate.evidence,
-        actor="online",
-        tags=candidate.tags,
+        rationale=str(decision.get("reason") or "Online maintainer add proposal"),
+        attribution=attribution,
     )
-    return {"action": "add", "candidate": asdict(candidate), "decision": decision, **result}
+    return {"requested_action": "add", "candidate": asdict(candidate), "decision": decision, **result}
 
 
 async def online_ingest(
@@ -295,10 +365,9 @@ async def online_ingest(
     side_query: SideQuery,
     skill_trace: dict[str, Any] | None = None,
     hint: str = "",
-    confirm_write: ConfirmWrite | None = None,
     target: str = "project",
 ) -> dict[str, Any]:
-    """在线自进化总入口：抽取候选、维护集合、请求写权限并记录全程审计。
+    """在线自进化总入口：抽取候选、维护集合、暂存 proposal 并记录全程审计。
 
     无论候选为空、被丢弃、拒绝、失败还是成功 add/merge，都会记录 provenance，确保
     后续 replay 评测能追溯 Skill 从哪段真实对话产生。
@@ -306,8 +375,8 @@ async def online_ingest(
     from .skills import record_online_provenance
 
     try:
-        # 第一步只抽取结构化候选，Extractor 本身没有文件写权限。
-        candidate = await extract_online_skill_candidate(
+        # 归因与抽取在一次隔离请求中完成；不可修复失败不会进入 Maintainer。
+        analysis = await analyze_online_feedback(
             messages=messages,
             side_query=side_query,
             skill_trace=skill_trace,
@@ -324,9 +393,11 @@ async def online_ingest(
         )
         return result
 
+    attribution = _attribution_payload(analysis)
+    candidate = analysis.candidate
     if candidate is None:
-        # “没有值得沉淀的经验”是正常终态，也记录 none 供后续统计。
-        result = {"ok": True, "action": "none"}
+        # 能力限制、评测噪声或没有结构化候选都是正常终态，并保留可审计归因。
+        result = {"ok": True, "action": "none", "attribution": attribution}
         record_online_provenance(
             action="none",
             result=result,
@@ -341,11 +412,13 @@ async def online_ingest(
             candidate=candidate,
             side_query=side_query,
             skill_trace=skill_trace,
-            confirm_write=confirm_write,
             target=target,
+            attribution=attribution,
         )
     except Exception as exc:
         result = {"ok": False, "action": "failed", "skill": candidate.name, "error": str(exc)}
+
+    result["attribution"] = attribution
 
     # 所有终态统一记录真实消息、身份引用、维护决策和错误，作为 replay 来源。
     record_online_provenance(

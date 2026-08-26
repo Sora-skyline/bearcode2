@@ -980,22 +980,6 @@ class Agent:
                 out.append({"role": role, "content": text})
         return out[-max(2, int(max_messages)) :]
 
-    async def _confirm_online_skill_write(self, summary: str) -> bool:
-        if self.permission_mode in {"bypassPermissions", "acceptEdits"}:
-            return True
-        if self.permission_mode in {"plan", "dontAsk"}:
-            return False
-        if self.confirm_fn is None:
-            return False
-        print_confirmation(summary)
-        try:
-            return bool(await self.confirm_fn(summary))
-        except Exception:
-            return False
-
-    async def _confirm_background_online_skill_write(self, summary: str) -> bool:
-        return self.permission_mode in {"bypassPermissions", "acceptEdits"}
-
     def _online_evolution_enabled(self) -> bool:
         raw = os.environ.get("BEAR_AUTO_SKILL_EVOLUTION", "1").strip().lower()
         return raw not in {"0", "false", "no", "off"}
@@ -1068,8 +1052,8 @@ class Agent:
                     compact[kind].append({key: value for key, value in item.items() if key in allowed})
         return compact
 
-    async def _run_online_skill_evolution(self, window: dict[str, Any], *, interactive_confirm: bool = False) -> None:
-        """把完整反馈窗口交给 Extractor/Maintainer，并在写入后刷新能力快照。"""
+    async def _run_online_skill_evolution(self, window: dict[str, Any]) -> None:
+        """把完整反馈窗口交给 Extractor/Maintainer，并暂存为不生效的 proposal。"""
         if not self._online_evolution_enabled() or self.permission_mode == "plan":
             return
         messages = list(window.get("messages") or [])
@@ -1090,20 +1074,25 @@ class Agent:
             side_query=side_query,
             skill_trace=window.get("skill_trace") or None,
             hint=str(window.get("hint") or ""),
-            confirm_write=self._confirm_online_skill_write if interactive_confirm else self._confirm_background_online_skill_write,
             target=os.environ.get("BEAR_AUTO_SKILL_TARGET", "project"),
         )
         if result.get("ok"):
-            if result.get("action") in {"add", "merge"}:
-                self._refresh_runtime_system_prompt()
-                print_info(f"Online skill {result.get('action')}: {result.get('skill')}")
+            if result.get("action") == "propose":
+                print_info(
+                    f"Online skill proposal staged: {result.get('skill')} "
+                    f"({result.get('proposal_id')})"
+                )
                 self._emit_event(
-                    "skill.evolved",
+                    "skill.proposed",
                     span_id=f"skill-{uuid.uuid4().hex[:12]}",
                     parent_span_id=self._turn_span_id or self._parent_span_id,
-                    payload={"action": result.get("action"), "skill": result.get("skill")},
+                    payload={
+                        "action": result.get("requested_action"),
+                        "skill": result.get("skill"),
+                        "proposalId": result.get("proposal_id"),
+                    },
                 )
-        elif result.get("action") not in {"add_denied", "merge_denied"}:
+        else:
             print_error(f"Online skill evolution failed: {result.get('error') or result}")
 
     async def _run_skill_usage_tracking(
@@ -1161,7 +1150,7 @@ class Agent:
             return {"ok": False, "error": "no pending online skill extraction window"}
         window = dict(pending)
         window["hint"] = hint
-        await self._run_online_skill_evolution(window, interactive_confirm=True)
+        await self._run_online_skill_evolution(window)
         self._pending_skill_extraction_window = None
         return {"ok": True}
 
