@@ -154,6 +154,19 @@ REPL 中也可以输入：
 python3 -m agents.main --resume
 ```
 
+### 7. 启动本地 Web Developer Console
+
+先构建一次前端，再启动只监听本机的控制台：
+
+```bash
+npm --prefix web install
+npm --prefix web run build
+python3 -m agents.main --web
+```
+
+浏览器访问 `http://127.0.0.1:8000`。前端开发时可另开终端运行
+`npm --prefix web run dev`；Vite 会把 `/api` 请求代理到本地 FastAPI。
+
 ## 如何让项目自动沉淀并进化 Skills
 
 Bear Code 的核心特色是 **自进化 Skills**。它可以从用户明确反馈中抽取未来可复用的规则，并自动新增或合并到项目级或用户级 `SKILL.md`。

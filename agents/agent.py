@@ -183,7 +183,11 @@ class Agent:
                  confirm_fn:Callable[[str], Awaitable[bool]] | None=None,
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
-                 is_sub_agent: bool=False,):
+                 is_sub_agent: bool=False,
+                 event_sink: Callable[..., dict[str, Any] | None] | None = None,
+                 agent_id: str = "main",
+                 parent_span_id: str | None = None,
+                 session_id: str | None = None,):
         """创建一份会话级 Runtime 状态，并按 API 协议初始化对应客户端。
 
         ``custom_system_prompt`` 和 ``custom_tools`` 主要供子 Agent/Skill fork 使用；
@@ -201,8 +205,19 @@ class Agent:
         self.confirm_fn = confirm_fn
         self._custom_system_prompt = custom_system_prompt
         self.effective_window=_get_context_windows(model) -20000
-        self.session_id = uuid.uuid4().hex[:8]
+        self.session_id = session_id or uuid.uuid4().hex[:8]
         self.session_start_time= time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
+        self._event_sink = event_sink
+        self.agent_id = agent_id
+        self._parent_span_id = parent_span_id
+        self._active_turn_id: str | None = None
+        self._turn_span_id: str | None = None
+        self._active_model_span_id: str | None = None
+        self._last_main_model_span_id: str | None = None
+        self._active_tool_span_id: str | None = None
+        self._api_base = api_base
+        self._anthropic_base_url = anthropic_base_url
+        self._api_key = api_key
 
         # ── 计量状态：每次模型响应后累计，用于 /cost 和预算熔断 ──
         self.total_input_tokens = 0
@@ -349,7 +364,7 @@ class Agent:
         return self._current_task is not None and not self._current_task.done()
 
     #大模型调用的工厂方法,构建一个用于记忆召回（memory recall）的 sideQuery 可调用对象，兼容anthropic, openai。
-    def _build_side_query(self, *, max_tokens: int = 256):
+    def _build_side_query(self, *, max_tokens: int = 256, purpose: str = "side-query"):
         """构造不污染主历史的轻量模型调用，供 Memory/Skill 判定复用。
 
         side query 使用相同客户端和模型，但只携带专用 system/user prompt；因此召回、
@@ -359,12 +374,32 @@ class Agent:
             client = self._anthropic_client
             model = self.model
             async def _sq(system:str, user_message:str)->str:
-
-                resp = await client.messages.create(
-                    model=model, max_tokens=max(1, int(max_tokens)), system=system,
-                messages=[{"role": "user", "content": user_message}],
-                )
+                span_id, started = self._model_started(purpose=purpose)
+                try:
+                    resp = await client.messages.create(
+                        model=model, max_tokens=max(1, int(max_tokens)), system=system,
+                        messages=[{"role": "user", "content": user_message}],
+                    )
+                except Exception as exc:
+                    self._model_finished(span_id, started, status="failed", payload={"purpose": purpose, "error": str(exc)})
+                    raise
                 text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+                usage = getattr(resp, "usage", None)
+                self._model_finished(
+                    span_id,
+                    started,
+                    status="completed",
+                    payload={
+                        "purpose": purpose,
+                        "model": model,
+                        "protocol": "anthropic",
+                        "stopReason": getattr(resp, "stop_reason", None),
+                        "tokenUsage": {
+                            "input": getattr(usage, "input_tokens", 0),
+                            "output": getattr(usage, "output_tokens", 0),
+                        },
+                    },
+                )
                 if not text.strip():
                     block_types = [str(getattr(b, "type", "")) for b in getattr(resp, "content", [])]
                     logging.warning(
@@ -379,14 +414,34 @@ class Agent:
             client = self._openai_client
             model = self.model
             async def _sq_openai(system:str, user_message:str)->str:
-                resp = await client.chat.completions.create(
-                    model=model,
-                    max_tokens=max(1, int(max_tokens)),
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_message},
-                    ],
-
+                span_id, started = self._model_started(purpose=purpose)
+                try:
+                    resp = await client.chat.completions.create(
+                        model=model,
+                        max_tokens=max(1, int(max_tokens)),
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user_message},
+                        ],
+                    )
+                except Exception as exc:
+                    self._model_finished(span_id, started, status="failed", payload={"purpose": purpose, "error": str(exc)})
+                    raise
+                usage = getattr(resp, "usage", None)
+                self._model_finished(
+                    span_id,
+                    started,
+                    status="completed",
+                    payload={
+                        "purpose": purpose,
+                        "model": model,
+                        "protocol": "openai",
+                        "stopReason": getattr(resp.choices[0], "finish_reason", None) if resp.choices else None,
+                        "tokenUsage": {
+                            "input": getattr(usage, "prompt_tokens", 0),
+                            "output": getattr(usage, "completion_tokens", 0),
+                        },
+                    },
                 )
                 if not resp.choices:
                     logging.warning("side_query returned no OpenAI-compatible choices: model=%s", model)
@@ -409,6 +464,135 @@ class Agent:
         self._aborted = True
         if self._current_task and not self._current_task.done():
             self._current_task.cancel()
+
+    def _emit_event(
+        self,
+        event_type: str,
+        *,
+        status: str = "completed",
+        span_id: str | None = None,
+        parent_span_id: str | None = None,
+        duration_ms: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """向可选事件接收器发布；事件系统故障绝不影响 Agent Loop。"""
+        event_sink = getattr(self, "_event_sink", None)
+        if event_sink is None:
+            return None
+        try:
+            return event_sink(
+                event_type,
+                status=status,
+                turn_id=getattr(self, "_active_turn_id", None),
+                span_id=span_id,
+                parent_span_id=parent_span_id,
+                agent_id=getattr(self, "agent_id", "main"),
+                duration_ms=duration_ms,
+                payload=payload,
+            )
+        except Exception as exc:
+            logging.warning("runtime event sink failed: %s", exc)
+            return None
+
+    def _model_started(self, *, purpose: str = "main") -> tuple[str, float]:
+        span_id = f"model-{uuid.uuid4().hex[:12]}"
+        if purpose == "main":
+            self._active_model_span_id = span_id
+            self._last_main_model_span_id = span_id
+        self._emit_event(
+            "model.started",
+            status="running",
+            span_id=span_id,
+            parent_span_id=getattr(self, "_turn_span_id", None) or getattr(self, "_parent_span_id", None),
+            payload={"model": self.model, "protocol": "openai" if self.use_openai else "anthropic", "purpose": purpose},
+        )
+        return span_id, time.perf_counter()
+
+    def _model_finished(
+        self,
+        span_id: str,
+        started: float,
+        *,
+        status: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        event_type = "model.completed" if status == "completed" else "model.failed"
+        self._emit_event(
+            event_type,
+            status=status,
+            span_id=span_id,
+            parent_span_id=getattr(self, "_turn_span_id", None) or getattr(self, "_parent_span_id", None),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            payload=payload,
+        )
+        if self._active_model_span_id == span_id:
+            self._active_model_span_id = None
+
+    async def _execute_tool_traced(self, call_id: str, name: str, inp: dict) -> str:
+        span_id = f"tool-{call_id or uuid.uuid4().hex[:12]}"
+        parent = (
+            getattr(self, "_active_model_span_id", None)
+            or getattr(self, "_last_main_model_span_id", None)
+            or getattr(self, "_turn_span_id", None)
+            or getattr(self, "_parent_span_id", None)
+        )
+        self._emit_event(
+            "tool.proposed",
+            status="proposed",
+            span_id=span_id,
+            parent_span_id=parent,
+            payload={"name": name, "input": inp},
+        )
+        self._active_tool_span_id = span_id
+        started = time.perf_counter()
+        self._emit_event(
+            "tool.started",
+            status="running",
+            span_id=span_id,
+            parent_span_id=parent,
+            payload={"name": name, "input": inp},
+        )
+        try:
+            raw_result = _safe_utf8_text(await self._execute_tool_call(name, inp))
+            result = self._persist_large_result(name, raw_result)
+        except Exception as exc:
+            self._emit_event(
+                "tool.failed",
+                status="failed",
+                span_id=span_id,
+                parent_span_id=parent,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                payload={"name": name, "input": inp, "error": str(exc)},
+            )
+            raise
+        else:
+            failed = self._looks_like_tool_failure(name, raw_result, result)
+            self._emit_event(
+                "tool.failed" if failed else "tool.completed",
+                status="failed" if failed else "completed",
+                span_id=span_id,
+                parent_span_id=parent,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                payload={"name": name, "input": inp, "result": result},
+            )
+            return result
+        finally:
+            if self._active_tool_span_id == span_id:
+                self._active_tool_span_id = None
+
+    def _emit_tool_denied(self, call_id: str, name: str, inp: dict, reason: str) -> None:
+        self._emit_event(
+            "tool.denied",
+            status="denied",
+            span_id=f"tool-{call_id or uuid.uuid4().hex[:12]}",
+            parent_span_id=(
+                getattr(self, "_active_model_span_id", None)
+                or getattr(self, "_last_main_model_span_id", None)
+                or getattr(self, "_turn_span_id", None)
+                or getattr(self, "_parent_span_id", None)
+            ),
+            payload={"name": name, "input": inp, "reason": reason},
+        )
 
     def set_confirm_fn(self, fn:Callable[[str], Awaitable[bool]]) -> None:
         self.confirm_fn = fn
@@ -463,6 +647,7 @@ class Agent:
         user_message: str,
         *,
         initial_skill_invocations: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
     ) -> None:
         """执行一轮完整对话，并在主回复后调度 Skill 反馈与演化任务。
 
@@ -473,6 +658,16 @@ class Agent:
         交给某个协议循环。协议循环可能请求模型多次，所以“一次 chat”不等于“一次 API
         请求”，而是直到模型给出最终文本为止的一整轮 Agent 任务。
         """
+        self._active_turn_id = turn_id or uuid.uuid4().hex[:12]
+        self._turn_span_id = f"turn-{self._active_turn_id}"
+        turn_started = time.perf_counter()
+        self._emit_event(
+            "turn.started",
+            status="running",
+            span_id=self._turn_span_id,
+            parent_span_id=self._parent_span_id,
+            payload={"userMessage": _safe_utf8_text(user_message)},
+        )
         # 阶段 1：首次对话发现 MCP 工具；子 Agent 不再重复创建 MCP 子进程。
         if not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
@@ -481,8 +676,21 @@ class Agent:
                 mcp_defs = self._mcp_manager.get_tool_definitions()
                 if mcp_defs:
                     self.tools = self.tools + mcp_defs
+                self._emit_event(
+                    "mcp.connected",
+                    span_id=f"mcp-{uuid.uuid4().hex[:12]}",
+                    parent_span_id=self._turn_span_id,
+                    payload={"toolCount": len(mcp_defs)},
+                )
             except Exception as e:
                 print_error(f"MCP init failed: {e}")
+                self._emit_event(
+                    "mcp.failed",
+                    status="failed",
+                    span_id=f"mcp-{uuid.uuid4().hex[:12]}",
+                    parent_span_id=self._turn_span_id,
+                    payload={"error": str(e)},
+                )
 
         # 阶段 2：保留纯用户输入用于审计，同时给实际模型输入追加相关 Skill 摘要。
         original_user_message = _safe_utf8_text(user_message)
@@ -493,6 +701,13 @@ class Agent:
             user_message, retrieved_hits, surfaced_hits = self._augment_user_message_with_skill_context(original_user_message)
             self._last_retrieved_skill_hits = retrieved_hits
             self._last_surfaced_skill_hits = surfaced_hits
+            for hit in retrieved_hits:
+                self._emit_event(
+                    "skill.retrieved",
+                    span_id=f"skill-{uuid.uuid4().hex[:12]}",
+                    parent_span_id=self._turn_span_id,
+                    payload={key: value for key, value in hit.items() if key != "content"},
+                )
 
         # 阶段 3：选择协议循环。两条循环语义相同，但消息/tool result 格式不同。
         # create_task 让 abort() 可以持有并取消整条 Agent 执行链，而不只是停止终端输出。
@@ -500,10 +715,13 @@ class Agent:
         self._turn_output_buffer = []
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.create_task(coro)
+        caught_error: Exception | None = None
         try:
             await self._current_task
         except asyncio.CancelledError:
             self._aborted = True
+        except Exception as exc:
+            caught_error = exc
 
         finally:
             self._current_task = None
@@ -513,8 +731,22 @@ class Agent:
         assistant_text = "".join(self._turn_output_buffer or []).strip()
         # 本轮收集已经结束，及时置空可避免后续非 chat 输出被误计入本轮回复。
         self._turn_output_buffer = None
+        turn_status = "failed" if caught_error else ("aborted" if self._aborted else "completed")
+        turn_type = "turn.failed" if caught_error else ("turn.aborted" if self._aborted else "turn.completed")
+        self._emit_event(
+            turn_type,
+            status=turn_status,
+            span_id=self._turn_span_id,
+            parent_span_id=self._parent_span_id,
+            duration_ms=int((time.perf_counter() - turn_started) * 1000),
+            payload={
+                "assistantText": assistant_text,
+                "error": str(caught_error) if caught_error else None,
+                "tokenUsage": self.get_token_usage(),
+            },
+        )
         # 子 Agent 不负责全局 Skill 学习；被用户中止的回复也不应作为有效样本。
-        if not self.is_sub_agent and not self._aborted:
+        if not self.is_sub_agent and not self._aborted and caught_error is None:
             skill_trace = self._skill_trace_snapshot()
             # 把任务丢进后台异步执行，不阻塞主对话响应, 后台判断本轮自动检索出的 Skill 是否相关、是否真正被模型采用。
             self._schedule_background_skill_task(
@@ -541,6 +773,13 @@ class Agent:
         if not self.is_sub_agent:
             print_divider()
             self._auto_save()
+        self._active_model_span_id = None
+        self._last_main_model_span_id = None
+        self._active_tool_span_id = None
+        self._active_turn_id = None
+        self._turn_span_id = None
+        if caught_error is not None:
+            raise caught_error
 
 
 
@@ -570,9 +809,28 @@ class Agent:
         text = _safe_utf8_text(text)
         if self._turn_output_buffer is not None:
             self._turn_output_buffer.append(text)
+        self._emit_event(
+            "assistant.delta",
+            status="streaming",
+            span_id=self._active_model_span_id or self._turn_span_id,
+            parent_span_id=self._turn_span_id or self._parent_span_id,
+            payload={"text": text},
+        )
         if self._output_buffer is not None:
             self._output_buffer.append(text)
         else:
+            print_assistant_text(text)
+
+    def _emit_thinking(self, text: str) -> None:
+        text = _safe_utf8_text(text)
+        self._emit_event(
+            "thinking.delta",
+            status="streaming",
+            span_id=self._active_model_span_id or self._turn_span_id,
+            parent_span_id=self._turn_span_id or self._parent_span_id,
+            payload={"text": text, "notice": "仅展示模型接口返回内容"},
+        )
+        if self._output_buffer is None:
             print_assistant_text(text)
 
     def _build_fold_guidance_section(self) -> str:
@@ -623,6 +881,12 @@ class Agent:
         self._tool_error_streak = 0
         self._same_tool_repeat_count = 0
         self._last_tool_name = ""
+        self._emit_event(
+            "context.compacted",
+            span_id=f"context-{uuid.uuid4().hex[:12]}",
+            parent_span_id=self._turn_span_id or self._parent_span_id,
+            payload={"foldCount": self._fold_count},
+        )
 
     def _looks_like_tool_failure(self, tool_name: str, raw: str, result: str) -> bool:
         """从统一工具文本中做保守的失败标记；结果仅用于提示，不决定执行成败。"""
@@ -812,7 +1076,7 @@ class Agent:
         if not messages:
             return
 
-        side_query = self._build_side_query(max_tokens=2200)
+        side_query = self._build_side_query(max_tokens=2200, purpose="skill-evolution")
         if side_query is None:
             return
 
@@ -833,6 +1097,12 @@ class Agent:
             if result.get("action") in {"add", "merge"}:
                 self._refresh_runtime_system_prompt()
                 print_info(f"Online skill {result.get('action')}: {result.get('skill')}")
+                self._emit_event(
+                    "skill.evolved",
+                    span_id=f"skill-{uuid.uuid4().hex[:12]}",
+                    parent_span_id=self._turn_span_id or self._parent_span_id,
+                    payload={"action": result.get("action"), "skill": result.get("skill")},
+                )
         elif result.get("action") not in {"add_denied", "merge_denied"}:
             print_error(f"Online skill evolution failed: {result.get('error') or result}")
 
@@ -860,7 +1130,7 @@ class Agent:
             return
         # side_query 使用相同模型发起一条与主对话历史隔离的辅助请求；700 token
         # 只供输出结构化判断，不会把裁判过程写回主 Agent 的消息列表。
-        side_query = self._build_side_query(max_tokens=700)
+        side_query = self._build_side_query(max_tokens=700, purpose="skill-usage-judge")
         try:
             from .online_skill_evolution import judge_retrieved_skill_adoption
             from .skills import record_usage_judgments
@@ -1019,7 +1289,12 @@ class Agent:
                     "model": self.model,
                     "cwd": str(Path.cwd()),
                     "startTime": self.session_start_time,
+                    "updatedTime": time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),
                     "messageCount": self._get_message_count(),
+                    "permissionMode": self.permission_mode,
+                    "protocol": "openai" if self.use_openai else "anthropic",
+                    "tokenUsage": self.get_token_usage(),
+                    "lastStatus": "aborted" if self._aborted else "completed",
                 },
                 "anthropicMessages": _sanitize_for_utf8(self._anthropic_messages) if not self.use_openai else None,
                 "openaiMessages": _sanitize_for_utf8(self._openai_messages) if self.use_openai else None,
@@ -1082,7 +1357,7 @@ class Agent:
 
     async def _generate_folded_session_memory(self, transcript: str) -> dict[str, Any]:
         """调用同模型 side query 生成折叠 JSON，失败时退回截断转录。"""
-        side_query = self._build_side_query(max_tokens=6000)
+        side_query = self._build_side_query(max_tokens=6000, purpose="context-folding")
         if side_query is None:
             return fallback_folded_memory(transcript)
         try:
@@ -1349,23 +1624,53 @@ class Agent:
                 else  [t for t in self.tools if t["name"] != "agent"]
             )
 
+            sub_span = f"subagent-{uuid.uuid4().hex[:12]}"
+            sub_started = time.perf_counter()
+            self._emit_event(
+                "subagent.started",
+                status="running",
+                span_id=sub_span,
+                parent_span_id=getattr(self, "_active_tool_span_id", None) or getattr(self, "_turn_span_id", None),
+                payload={"type": "skill-fork", "description": inp.get("skill_name", "")},
+            )
             print_sub_agent_start("skill-fork", inp.get("skill_name", ""))
             sub_agent = Agent(
                 model=self.model,
-                api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+                api_base=getattr(self, "_api_base", None),
+                anthropic_base_url=getattr(self, "_anthropic_base_url", None),
+                api_key=getattr(self, "_api_key", None),
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
                 permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+                event_sink=getattr(self, "_event_sink", None),
+                agent_id=f"{getattr(self, 'agent_id', 'main')}/skill-{inp.get('skill_name', 'fork')}",
+                parent_span_id=sub_span,
+                session_id=getattr(self, "session_id", None),
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
                 self.total_input_tokens += sub_result["tokens"]["input"]
                 self.total_output_tokens += sub_result["tokens"]["output"]
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
+                self._emit_event(
+                    "subagent.completed",
+                    span_id=sub_span,
+                    parent_span_id=getattr(self, "_active_tool_span_id", None) or getattr(self, "_turn_span_id", None),
+                    duration_ms=int((time.perf_counter() - sub_started) * 1000),
+                    payload={"type": "skill-fork", "description": inp.get("skill_name", "")},
+                )
                 return sub_result["text"] or "(Skill produced no output)"
             except Exception as e:
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
+                self._emit_event(
+                    "subagent.failed",
+                    status="failed",
+                    span_id=sub_span,
+                    parent_span_id=getattr(self, "_active_tool_span_id", None) or getattr(self, "_turn_span_id", None),
+                    duration_ms=int((time.perf_counter() - sub_started) * 1000),
+                    payload={"type": "skill-fork", "error": str(e)},
+                )
                 return f"Skill fork error: {e}"
 
         return f'[Skill "{inp.get("skill_name", "")}" activated]\n\n{result["prompt"]}'
@@ -1387,10 +1692,10 @@ class Agent:
                 return "Not in plan mode."
             plan_content = "(No plan file found)"
             if self._plan_file_path and Path(self._plan_file_path).exists():
-                plan_content = self._plan_file_path
+                plan_content = Path(self._plan_file_path).read_text(encoding="utf-8")
             # 交互式审批流程（如果有审批函数）
             if self._plan_approval_fn:
-                result = self._plan_approval_fn(plan_content)
+                result = await self._plan_approval_fn(plan_content)
                 choice = result.get("choice", "manual-execute")
 
                 if choice =="keep-planning":
@@ -1409,7 +1714,7 @@ class Agent:
                     target_mode = self._pre_plan_mode or "default"
 
                 #离开计划模式
-                self._pre_plan_mode = target_mode
+                self.permission_mode = target_mode
                 self._pre_plan_mode = None
                 saved_plan_path = self._plan_file_path
                 self._plan_file_path = None
@@ -1463,26 +1768,56 @@ class Agent:
         agent_type = inp.get("type", "general")
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
+        sub_span = f"subagent-{uuid.uuid4().hex[:12]}"
+        sub_started = time.perf_counter()
+        self._emit_event(
+            "subagent.started",
+            status="running",
+            span_id=sub_span,
+            parent_span_id=getattr(self, "_active_tool_span_id", None) or getattr(self, "_turn_span_id", None),
+            payload={"type": agent_type, "description": description},
+        )
         print_sub_agent_start(agent_type, description)
 
         config = get_sub_agent_config(agent_type)
 
         sub_agent = Agent(
             model=self.model,
-            api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+            api_base=getattr(self, "_api_base", None),
+            anthropic_base_url=getattr(self, "_anthropic_base_url", None),
+            api_key=getattr(self, "_api_key", None),
             custom_system_prompt=config["system_prompt"],
             custom_tools=config["tools"],
             is_sub_agent=True,
             permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+            event_sink=getattr(self, "_event_sink", None),
+            agent_id=f"{getattr(self, 'agent_id', 'main')}/{agent_type}",
+            parent_span_id=sub_span,
+            session_id=getattr(self, "session_id", None),
         )
         try:
             result = await sub_agent.run_once(prompt)
             self.total_input_tokens += result["tokens"]["input"]
             self.total_output_tokens += result["tokens"]["output"]
             print_sub_agent_end(agent_type, description)
+            self._emit_event(
+                "subagent.completed",
+                span_id=sub_span,
+                parent_span_id=getattr(self, "_active_tool_span_id", None) or getattr(self, "_turn_span_id", None),
+                duration_ms=int((time.perf_counter() - sub_started) * 1000),
+                payload={"type": agent_type, "description": description},
+            )
             return result["text"] or "(Sub-agent produced no output)"
         except Exception as e:
             print_sub_agent_end(agent_type, description)
+            self._emit_event(
+                "subagent.failed",
+                status="failed",
+                span_id=sub_span,
+                parent_span_id=getattr(self, "_active_tool_span_id", None) or getattr(self, "_turn_span_id", None),
+                duration_ms=int((time.perf_counter() - sub_started) * 1000),
+                payload={"type": agent_type, "description": description, "error": str(e)},
+            )
             return f"Sub-agent error: {e}"
 
 #--------------Anthropic 后端---------------
@@ -1502,7 +1837,7 @@ class Agent:
         # 这里只启动后台任务，不阻塞当前模型调用流程。
         memory_prefetch:MemoryPrefetch | None = None
         if not self.is_sub_agent:
-            sq = self._build_side_query()
+            sq = self._build_side_query(purpose="memory-recall")
             if sq:
                 memory_prefetch = start_memory_prefetch(
                     user_message, sq,
@@ -1544,6 +1879,12 @@ class Agent:
                             # 记录本 session 已经注入过的 memory，后续检索时可避免重复 surfaced。
                             self._already_surfaced_memories.add(m.path)
                             self._session_memory_bytes += m.size
+                            self._emit_event(
+                                "memory.recalled",
+                                span_id=f"memory-{uuid.uuid4().hex[:12]}",
+                                parent_span_id=self._turn_span_id,
+                                payload={"path": m.path, "size": m.size},
+                            )
                 except:
                     # memory 注入失败不应该中断主对话流程。
                     pass
@@ -1562,14 +1903,21 @@ class Agent:
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
                     perm = check_permission(block["name"], block["input"], self.permission_mode, self._plan_file_path)
                     if perm["action"]=="allow":
-                        task =asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
+                        task =asyncio.create_task(
+                            self._execute_tool_traced(block["id"], block["name"], block["input"])
+                        )
                         early_executions[block["id"]] = task
 
 
             # 调用 Anthropic 流式接口。system、tools 和完整消息历史都会随本次请求发出；
             # 模型没有隐藏的本地状态，只能看到 Harness 明确放进请求的内容。
             # 流式过程中完成 tool block 时会触发 _on_tool_block。
-            response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            model_span, model_started = self._model_started()
+            try:
+                response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            except Exception as exc:
+                self._model_finished(model_span, model_started, status="failed", payload={"error": str(exc)})
+                raise
             if not self.is_sub_agent:
                 stop_spinner()
 
@@ -1578,6 +1926,24 @@ class Agent:
             self.total_input_tokens += response.usage.input_tokens
             self.total_output_tokens += response.usage.output_tokens
             self.last_input_token_count = response.usage.input_tokens
+            self._model_finished(
+                model_span,
+                model_started,
+                status="completed",
+                payload={
+                    "model": self.model,
+                    "protocol": "anthropic",
+                    "purpose": "main",
+                    "stopReason": getattr(response, "stop_reason", None),
+                    "tokenUsage": {"input": response.usage.input_tokens, "output": response.usage.output_tokens},
+                },
+            )
+            self._emit_event(
+                "budget.updated",
+                span_id=f"budget-{uuid.uuid4().hex[:12]}",
+                parent_span_id=getattr(self, "_turn_span_id", None),
+                payload={"tokenUsage": self.get_token_usage(), "costUsd": self._get_current_cost_usd()},
+            )
 
             # Anthropic 的响应内容里可能混有 text block 和 tool_use block，这里只挑出工具调用。
             tool_uses = [b for b in response.content if b.type == "tool_use"]
@@ -1648,6 +2014,7 @@ class Agent:
                     # 权限拒绝时，也要返回一个 tool_result，让模型知道该工具调用失败的原因。
                     print_info(f"Denied: {perm.get('message', '')}")
                     self._record_tool_outcome(tu.name, False)
+                    self._emit_tool_denied(tu.id, tu.name, inp, perm.get("message", ""))
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
                                          "content": f"Action denied: {perm.get('message', '')}"})
                     continue
@@ -1664,7 +2031,7 @@ class Agent:
 
                 # 权限通过后执行工具，并把大输出持久化为可回传的摘要或引用。
                 try:
-                    raw = await self._execute_tool_call(tu.name, inp)
+                    raw = await self._execute_tool_traced(tu.id, tu.name, inp)
                 except Exception as e:
                     raw = f"Error executing tool: {e}"
                 raw = _safe_utf8_text(raw)
@@ -1755,7 +2122,8 @@ class Agent:
                         if hasattr(delta, "text"):
                             if first_text:
                                 stop_spinner()
-                                self._emit_text("\n")
+                                if self._output_buffer is None:
+                                    print_assistant_text("\n")
                                 first_text = False
                             self._emit_text(delta.text)
                         #第二种，thinking 内容：
@@ -1763,9 +2131,10 @@ class Agent:
                         elif hasattr(delta, 'thinking'):
                             if first_text:
                                 stop_spinner()
-                                self._emit_text("\n  [thinking] ")
+                                if self._output_buffer is None:
+                                    print_assistant_text("\n  [thinking] ")
                                 first_text = False
-                            self._emit_text(delta.thinking)
+                            self._emit_thinking(delta.thinking)
                         #第三种，工具参数 JSON 片段：工具调用的参数不是一次性返回，
                         # 而是一段一段返回，所以这里不断拼接到 input_json。
                         elif hasattr(delta, 'partial_json'):
@@ -1813,7 +2182,7 @@ class Agent:
         # 主 Agent 异步预取 Memory；子 Agent 依靠自己的隔离 prompt，不读取长期记忆。
         memory_prefetch: MemoryPrefetch | None = None
         if not self.is_sub_agent:
-            sq = self._build_side_query()
+            sq = self._build_side_query(purpose="memory-recall")
             if sq:
                 memory_prefetch = start_memory_prefetch(
                     user_message, sq,
@@ -1851,6 +2220,12 @@ class Agent:
                             # 记录去重集合和会话字节预算，控制后续轮次的重复/过量召回。
                             self._already_surfaced_memories.add(m.path)
                             self._session_memory_bytes += len(m.content.encode())
+                            self._emit_event(
+                                "memory.recalled",
+                                span_id=f"memory-{uuid.uuid4().hex[:12]}",
+                                parent_span_id=self._turn_span_id,
+                                payload={"path": m.path, "size": len(m.content.encode())},
+                            )
                 except Exception:
                     pass
 
@@ -1859,7 +2234,12 @@ class Agent:
 
             # 请求中携带 system/user/assistant/tool 历史和当前可见工具 schema。
             # 这里返回的是已由 _call_openai_stream 从分片重新组装好的完整响应。
-            response = await self._call_openai_stream()
+            model_span, model_started = self._model_started()
+            try:
+                response = await self._call_openai_stream()
+            except Exception as exc:
+                self._model_finished(model_span, model_started, status="failed", payload={"error": str(exc)})
+                raise
 
             if not self.is_sub_agent:
                 stop_spinner()
@@ -1873,6 +2253,25 @@ class Agent:
 
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
             message = choice.get("message", {})
+            usage = response.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0}
+            self._model_finished(
+                model_span,
+                model_started,
+                status="completed",
+                payload={
+                    "model": self.model,
+                    "protocol": "openai",
+                    "purpose": "main",
+                    "stopReason": choice.get("finish_reason"),
+                    "tokenUsage": {"input": usage["prompt_tokens"], "output": usage["completion_tokens"]},
+                },
+            )
+            self._emit_event(
+                "budget.updated",
+                span_id=f"budget-{uuid.uuid4().hex[:12]}",
+                parent_span_id=getattr(self, "_turn_span_id", None),
+                payload={"tokenUsage": self.get_token_usage(), "costUsd": self._get_current_cost_usd()},
+            )
 
             # assistant 消息必须先入历史。后面追加的 role=tool 要用 tool_call_id 指向它。
             self._openai_messages.append(message)
@@ -1895,117 +2294,89 @@ class Agent:
             for tc in tool_calls:
                 if self._aborted:
                     break
-
                 if tc.get("type") != "function":
                     continue
-
                 fn_name = tc["function"]["name"]
                 try:
-                    # function.arguments 在协议中是 JSON 字符串，不是已经可调用的 Python 参数。
                     inp = json.loads(tc["function"]["arguments"])
                 except Exception:
                     inp = {}
-
                 print_tool_call(fn_name, inp)
-
-                # 模型能提出工具调用不代表一定能执行；本地权限层拥有最终决定权。
                 perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
-
                 if perm["action"] == "deny":
                     print_info(f"Denied: {perm.get('message', '')}")
                     self._record_tool_outcome(fn_name, False)
-                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
-                                        "result": f"Action denied: {perm.get('message', '')}"})
+                    self._emit_tool_denied(tc.get("id", ""), fn_name, inp, perm.get("message", ""))
+                    oai_checked.append({
+                        "tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
+                        "result": f"Action denied: {perm.get('message', '')}",
+                    })
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
-                    # 弹出终端对话框，让用户确认危险操作
                     confirmed = await self._confirm_dangerous(perm["message"])
-                    # 用户点击拒绝的情况
                     if not confirmed:
                         self._record_tool_outcome(fn_name, False)
-                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
-                                            "result": "User denied this action."})
+                        self._emit_tool_denied(tc.get("id", ""), fn_name, inp, "User denied this action.")
+                        oai_checked.append({
+                            "tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
+                            "result": "User denied this action.",
+                        })
                         continue
-                    # 用户点击同意：加入已确认集合，下次不再弹窗
                     self._confirmed_paths.add(perm["message"])
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
-                oai_batches: list[dict] = []
-                for ct in oai_checked:
-                    # 只读、无副作用的工具可放入并发批次；写文件和 Shell 等保持串行，(cy)
-                    # 避免执行顺序变化导致后一个调用看不到前一个调用产生的状态。
-                    safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
-                    if safe and oai_batches and oai_batches[-1]["concurrent"]:
-                        oai_batches[-1]["items"].append(ct)
-                    else:
-                        oai_batches.append({"concurrent": safe, "items": [ct]})
+            # 先完成整批权限判断，再按副作用边界分批执行，确保每个 tool_call 只执行一次。
+            oai_batches: list[dict] = []
+            for ct in oai_checked:
+                safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+                if safe and oai_batches and oai_batches[-1]["concurrent"]:
+                    oai_batches[-1]["items"].append(ct)
+                else:
+                    oai_batches.append({"concurrent": safe, "items": [ct]})
 
-                # 当前工具执行阶段的熔断标记。某个工具若触发上下文压缩，后续批次必须停止，
-                # 避免继续执行基于旧消息历史生成的工具调用。
-                oai_context_break = False
-                for batch in oai_batches:
-                    # 用户中止或上下文已经被替换时，不再消费尚未执行的批次。
-                    if oai_context_break or self._aborted:
+            oai_context_break = False
+            for batch in oai_batches:
+                if oai_context_break or self._aborted:
+                    break
+                if batch["concurrent"]:
+                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                        raw = await self._execute_tool_traced(
+                            ct_item["tc"].get("id", ""), ct_item["fn"], ct_item["inp"]
+                        )
+                        raw = _safe_utf8_text(raw)
+                        res = self._persist_large_result(ct_item["fn"], raw)
+                        print_tool_result(ct_item["fn"], res)
+                        return ct_item, res
+
+                    results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
+                    for ct_item, res in results:
+                        self._record_tool_outcome(
+                            ct_item["fn"], not self._looks_like_tool_failure(ct_item["fn"], "", res)
+                        )
+                        self._openai_messages.append({
+                            "role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res,
+                        })
+                    continue
+
+                for ct in batch["items"]:
+                    if not ct["allowed"]:
+                        self._openai_messages.append({
+                            "role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"],
+                        })
+                        continue
+                    raw = await self._execute_tool_traced(ct["tc"].get("id", ""), ct["fn"], ct["inp"])
+                    raw = _safe_utf8_text(raw)
+                    res = self._persist_large_result(ct["fn"], raw)
+                    print_tool_result(ct["fn"], res)
+                    self._record_tool_outcome(ct["fn"], not self._looks_like_tool_failure(ct["fn"], raw, res))
+                    if self._context_cleared:
+                        self._context_cleared = False
+                        self._openai_messages.append({"role": "user", "content": res})
+                        oai_context_break = True
                         break
-                    # 并发批次只包含已通过权限检查、且声明为无副作用的工具。
-                    if batch["concurrent"]:
-                        async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
-                            # 每个任务独立执行工具并规范化结果；过大的结果会先落盘，
-                            # 返回可安全放进模型上下文的预览或文件引用。
-                            raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct_item["fn"], raw)
-                            print_tool_result(ct_item["fn"], res)
-                            # 连同原始调用信息返回，以便稍后取出对应的 tool_call_id。
-                            return ct_item, res
-
-                        # gather 保持结果顺序与 batch["items"] 一致，同时缩短多个只读工具的总耗时。
-                        results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                        for ct_item, res in results:
-                            # 记录运行质量信号，供上下文折叠策略判断连续失败和重复调用。
-                            self._record_tool_outcome(
-                                ct_item["fn"],
-                                not self._looks_like_tool_failure(ct_item["fn"], "", res),
-                            )
-                            # OpenAI 协议要求每个工具结果用 tool_call_id 与 assistant 的调用一一对应；
-                            # 下一次模型请求会携带这些 role=tool 消息，让模型继续推理。
-                            self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
-                    else: # 串行批次执行
-                        for ct in batch["items"]:
-                            if not ct["allowed"]:# 先处理权限被拒绝的工具
-                                # 即使权限拒绝，也必须返回 role=tool，让模型看到失败原因并改道。
-                                self._openai_messages.append(
-                                    {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
-                                continue
-                            # 正常放行工具串行执行
-                            raw = await self._execute_tool_call(ct["fn"], ct["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct["fn"], raw)
-                            print_tool_result(ct["fn"], res)
-                            self._record_tool_outcome(
-                                ct["fn"],
-                                not self._looks_like_tool_failure(ct["fn"], raw, res),
-                            )
-                            # 核心特殊逻辑：self._context_cleared 上下文清空熔断
-                            # 当本轮工具执行后，上下文 token 超限，触发了全局上下文清理机制（/compact 压缩或内存溢出裁剪），self._context_cleared 被标记为 True。
-                            
-                            # 执行动作
-                            # 1 重置清空标记 self._context_cleared = False
-                            # 2 这条工具结果不按标准 role:tool 塞入，改用 role:user 包裹追加（OpenAI 协议上下文重置兼容写法）
-                            # 3 把全局熔断开关 oai_context_break = True
-                            # 4 break 跳出当前串行批次循环
-                            # 5 外层大循环检测到 oai_context_break=True，直接终止后面所有剩余工具批次不再执行
-                            # 设计目的
-                            # 上下文已经被大量裁剪、历史消息丢失，继续执行后续工具已经没有业务意义；强行终止工具队列，立刻把精简后的上下文丢给 LLM 进入下一轮思考，避免无效消耗 API 额度和磁盘 IO。
-                            if self._context_cleared:
-                                self._context_cleared = False
-                                self._openai_messages.append({"role": "user", "content": res})
-                                oai_context_break = True
-                                break
-                            # 未触发清空则正常拼装消息
-                            self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
+                    self._openai_messages.append({
+                        "role": "tool", "tool_call_id": ct["tc"]["id"], "content": res,
+                    })
 
             self._context_cleared = False
             self._refresh_runtime_system_prompt()
@@ -2046,7 +2417,8 @@ class Agent:
                     # 正文分片可边收边显示，同时累积起来写入 assistant 消息历史。
                     if first_text:
                         stop_spinner()
-                        self._emit_text("\n")
+                        if self._output_buffer is None:
+                            print_assistant_text("\n")
                         first_text = False
                     self._emit_text(delta.content)
                     content += _safe_utf8_text(delta.content)

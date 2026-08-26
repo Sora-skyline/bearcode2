@@ -63,6 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
     parser.add_argument("--resume", action="store_true", help="Resume last session")
+    parser.add_argument("--web", action="store_true", help="Start the local Web Developer Console")
+    parser.add_argument("--port", type=int, default=8000, help="Web Console port (default: 8000)")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
@@ -261,7 +263,7 @@ async def run_repl(agent: Agent) -> None:
             continue
         if inp == "/skill-eval":
             # REPL 能访问 Agent 客户端，因此传入 side_query 启用 LLM judge 和候选试跑。
-            side_query = agent._build_side_query(max_tokens=2400)
+            side_query = agent._build_side_query(max_tokens=2400, purpose="skill-eval")
             print_info(await format_online_skill_eval_async(side_query=side_query))
             continue
         if inp.startswith("/extract_now"):
@@ -375,6 +377,8 @@ Options:
   --model, -m         Model to use (default: deepseek-chat, or MODEL env)
   --api-base URL      Override API base URL from CLI or .env
   --resume            Resume the last session
+  --web               Start the local Web Developer Console
+  --port N            Web Console port (default: 8000)
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
   --help, -h          Show this help
@@ -411,6 +415,30 @@ Examples:
     # 模型优先使用命令行参数，其次读取 .env 中的 MODEL，最后回落到默认模型。
     model = args.model or os.environ.get("MODEL") or "deepseek-chat"
     resolved_api_base, resolved_api_key, resolved_use_openai = _resolve_api_config(args.api_base)
+
+    if args.web:
+        if not 1 <= args.port <= 65535:
+            print_error("--port must be between 1 and 65535")
+            sys.exit(2)
+        try:
+            import uvicorn
+            from .web_runtime import WebRuntimeManager, create_web_app
+        except ImportError:
+            print_error("Web dependencies are missing. Run: pip install -r requirements.txt")
+            sys.exit(1)
+        manager = WebRuntimeManager(
+            model=model,
+            api_base=resolved_api_base,
+            api_key=resolved_api_key,
+            use_openai=resolved_use_openai,
+            permission_mode=permission_mode,
+            thinking=args.thinking,
+            max_cost_usd=args.max_cost,
+            max_turns=args.max_turns,
+        )
+        print_info(f"Bear Code Developer Console: http://127.0.0.1:{args.port}")
+        uvicorn.run(create_web_app(manager), host="127.0.0.1", port=args.port, log_level="info")
+        return
 
     # 没有可用 API key 时无法调用模型，直接提示配置方式并退出。
     if not resolved_api_key:
