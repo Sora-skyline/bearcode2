@@ -11,6 +11,7 @@ Bear Agent 是一个基于 Python 实现的 **自进化 Harness Agent**。它不
 - **可归因的 Skills 自进化**：先把跨轮反馈归因为 `skill_gap / capability_limit / evaluation_noise`，只有可修复缺口才能形成隔离 proposal；通过评测和显式发布后才新增或合并 active `SKILL.md`。
 - **双锚点回归治理**：候选在 dev 样本上选优后，在隔离 promotion-test 上逐样本对比当前 active，并继续通过历史 champion gate；平均分上涨不能掩盖已有能力回退。
 - **完整 Agent Loop**：模型请求、tool call 解析、权限检查、工具执行、tool result 回写、继续推理、会话保存形成闭环。
+- **轻量 Docker Sandbox**：Shell、测试构建和受信任 MCP 在会话级容器内运行；Approval 与隔离分层，`--yolo` 也不能访问 workspace 外的宿主资源。
 - **OpenAI / Anthropic 双协议**：支持 OpenAI-compatible 和 Anthropic-compatible 接口，便于接入不同模型服务或代理网关。
 - **工具系统与权限控制**：支持读写文件、精确编辑、代码搜索、Shell 命令、Skill 调用、子 Agent 和 MCP 工具；Plan Mode 下阻断写操作和 Shell。
 - **Skills 体系**：通过项目级和用户级 `SKILL.md` 保存可复用任务方法，支持检索、调用、inline / fork 执行和版本化演化。
@@ -47,6 +48,7 @@ BearAgent/
 │   ├── main.py                    # CLI 入口、REPL、参数解析
 │   ├── agent.py                   # Agent Runtime、模型调用、工具调度、上下文压缩
 │   ├── tools.py                   # 内置工具和权限系统
+│   ├── sandbox.py                 # Docker Sandbox Session、资源限制和执行事件
 │   ├── prompt.py                  # System prompt 动态构建
 │   ├── skills.py                  # Skills 加载、检索、执行、创建和演化封装
 │   ├── online_skill_evolution.py  # 在线反馈归因、Skill 抽取和 add/merge/discard 决策
@@ -61,7 +63,8 @@ BearAgent/
 │   ├── skills/                    # 项目级 Skills
 │   └── skill-evolution/           # Skills 自进化审计产物
 ├── wiki/                          # 项目文档中心
-├── Dockerfile
+├── Dockerfile                     # 完整 Harness 镜像
+├── Dockerfile.sandbox             # 独立执行 Sandbox 镜像
 ├── requirements.txt
 └── README.md
 ```
@@ -88,7 +91,9 @@ pip install -r requirements.txt
 
 ### 2. 配置 `.env`
 
-项目会自动读取当前目录或父目录中的 `.env`。
+项目会自动读取当前目录或父目录中的 `.env`。Sandbox 会挂载整个项目目录，因此项目内
+`.env` 也能被容器读取；如果需要让模型密钥只留在控制面，优先使用宿主环境变量，或把
+`.env` 放在 workspace 外的父目录。`.dockerignore` 不会过滤运行时 bind mount。
 
 Anthropic-compatible 示例：
 
@@ -121,6 +126,12 @@ MODEL=deepseek-chat
 - `--model` 会覆盖 `.env` 中的 `MODEL`。
 
 ### 3. 启动 REPL
+
+先构建独立执行镜像（Harness 和宿主环境中的模型密钥不注入容器；项目内 `.env` 会随 workspace 挂载，建议将 Key 放在宿主环境或 workspace 外）：
+
+```bash
+docker build -f Dockerfile.sandbox -t bear-code-sandbox:latest .
+```
 
 ```bash
 python3 -m agents.main
@@ -170,6 +181,31 @@ python3 -m agents.main --web
 
 浏览器访问 `http://127.0.0.1:8000`。前端开发时可另开终端运行
 `npm --prefix web run dev`；Vite 会把 `/api` 请求代理到本地 FastAPI。
+
+## Sandbox 安全模型
+
+默认 Shell 与已信任的 stdio MCP Server 运行在每个主 Session 懒创建的持久 Docker
+容器中。容器只读挂载系统层，只把当前 workspace 读写挂载到 `/workspace`，并启用默认
+断网、非 root UID、`cap-drop=ALL`、`no-new-privileges`、1 CPU、1 GiB 内存和 128 PID
+上限。Docker 不可用时 Shell 会 fail closed，不会偷偷退回宿主机。
+
+Web 顶栏会直接显示 Sandbox `未启动/运行中/已停止/已关闭/本地不隔离` 状态；没有
+`sandbox.created` 的会话并未创建 Container，收尾时也不会产生虚假的 `sandbox.destroyed`。
+独立镜像会预装项目 `requirements.txt` 和 pytest，源码则通过 `/workspace` bind mount 复用。
+
+Approval 和 Sandbox 是两层：`default/acceptEdits/plan/bypassPermissions` 决定是否询问，
+Docker 决定命令实际上能访问什么。因此 `--yolo` 只跳过询问；只有启动时显式传入
+`--unsafe-local` 才会关闭 Docker 隔离。文件工具仍在宿主侧执行，但 canonical path
+只能位于 workspace 或明确的 Runtime 状态目录，拒绝绝对路径越界、`..` 和符号链接逃逸。
+
+项目配置示例见 [`.bear/settings.example.json`](.bear/settings.example.json)。可重复演示：
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/sandbox_demo.py
+```
+
+报告写入 `.bear/sandbox-evaluation.json`，包含攻击用例通过率、冷启动、warm command P95
+和超时进程树清理结果。设计与面试讲法见 [`wiki/Sandbox架构与面试演示.md`](wiki/Sandbox架构与面试演示.md)。
 
 ## 如何让项目自动沉淀并进化 Skills
 
@@ -438,6 +474,10 @@ mcp__<serverName>__<toolName>
 
 ## Docker 运行
 
+这是把完整 Harness 放进一个外层容器的旧兼容方式，不是推荐的独立执行面。由于容器内
+不会挂 Docker Socket（也不应该挂），启动参数需显式使用 `--unsafe-local`；此时外层容器
+本身承担隔离。推荐开发方式仍是宿主 Harness + 前文的 `Dockerfile.sandbox`。
+
 构建镜像：
 
 ```bash
@@ -452,7 +492,7 @@ docker run --rm -it \
   -v "$PWD:/workspace" \
   -v bear-code-sessions:/root/.bear-code \
   -v bear-code-memory:/root/.BearCode \
-  bear-code
+  bear-code --unsafe-local
 ```
 
 允许自动抽取 Skill proposals（不会自动发布 active）：
@@ -465,7 +505,7 @@ docker run --rm -it \
   -v "$PWD:/workspace" \
   -v bear-code-sessions:/root/.bear-code \
   -v bear-code-memory:/root/.BearCode \
-  bear-code
+  bear-code --unsafe-local
 ```
 
 ## 重要数据路径
@@ -490,6 +530,8 @@ docker run --rm -it \
 | [架构设计](wiki/架构设计.md) | 系统分层、主链路、模块边界和数据流 |
 | [核心源码阅读指南](wiki/核心源码阅读指南.md) | 按源码顺序学习 Agent Loop、工具、Skills、Memory、MCP 和自进化 |
 | [技术亮点](wiki/技术亮点.md) | 技术亮点和核心代码讲解 |
+| [Sandbox 架构与演示](wiki/Sandbox架构与面试演示.md) | 隔离边界、威胁模型、演示脚本和面试回答 |
+| [Sandbox 评测报告](wiki/Sandbox评测报告.md) | 自动化攻击用例、性能指标状态与当前限制 |
 | [Skills 自进化逻辑](wiki/Skills自进化逻辑与实现思路.md) | 自进化设计和实现取舍 |
 | [简历包装](wiki/简历包装.md) | 简历 bullet、面试表达和项目包装 |
 

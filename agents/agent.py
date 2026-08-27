@@ -42,6 +42,7 @@ import openai
 from agents.mcp_client import McpManager
 from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories_for_injection
 from agents.prompt import build_system_prompt
+from agents.sandbox import SandboxConfig, SandboxSession, load_sandbox_config
 from agents.session_memory import (
     FOLD_SESSION_MEMORY_SYSTEM,
     build_anthropic_transcript,
@@ -187,7 +188,10 @@ class Agent:
                  event_sink: Callable[..., dict[str, Any] | None] | None = None,
                  agent_id: str = "main",
                  parent_span_id: str | None = None,
-                 session_id: str | None = None,):
+                 session_id: str | None = None,
+                 sandbox_config: SandboxConfig | None = None,
+                 sandbox_session: SandboxSession | None = None,
+                 unsafe_local: bool = False,):
         """创建一份会话级 Runtime 状态，并按 API 协议初始化对应客户端。
 
         ``custom_system_prompt`` 和 ``custom_tools`` 主要供子 Agent/Skill fork 使用；
@@ -218,6 +222,19 @@ class Agent:
         self._api_base = api_base
         self._anthropic_base_url = anthropic_base_url
         self._api_key = api_key
+
+        # ── 执行面：主 Agent 拥有会话级 Sandbox，子 Agent 共享且不能扩大边界 ──
+        if sandbox_session is not None:
+            self._sandbox_session = sandbox_session
+            self._owns_sandbox = False
+        else:
+            config = sandbox_config or load_sandbox_config(unsafe_local=unsafe_local)
+            self._sandbox_session = SandboxSession(
+                config,
+                session_id=self.session_id,
+                event_sink=self._emit_event,
+            )
+            self._owns_sandbox = True
 
         # ── 计量状态：每次模型响应后累计，用于 /cost 和预算熔断 ──
         self.total_input_tokens = 0
@@ -252,7 +269,7 @@ class Agent:
         self._read_file_state: dict[str, float] ={}
 
         # ── 外部能力：MCP 在第一次 chat 时懒连接，避免启动 CLI 就拉起子进程 ──
-        self._mcp_manager = McpManager()
+        self._mcp_manager = McpManager(self._sandbox_session)
         self._mcp_initialized = False
 
         # ── 长期 Memory：去重集合与字节预算防止同一事实反复注入 ──
@@ -536,12 +553,17 @@ class Agent:
             or getattr(self, "_turn_span_id", None)
             or getattr(self, "_parent_span_id", None)
         )
+        event_input = (
+            {"command": "[REDACTED: see sandbox command hash]", "timeout": inp.get("timeout")}
+            if name == "run_shell"
+            else inp
+        )
         self._emit_event(
             "tool.proposed",
             status="proposed",
             span_id=span_id,
             parent_span_id=parent,
-            payload={"name": name, "input": inp},
+            payload={"name": name, "input": event_input},
         )
         self._active_tool_span_id = span_id
         started = time.perf_counter()
@@ -550,7 +572,7 @@ class Agent:
             status="running",
             span_id=span_id,
             parent_span_id=parent,
-            payload={"name": name, "input": inp},
+            payload={"name": name, "input": event_input},
         )
         try:
             raw_result = _safe_utf8_text(await self._execute_tool_call(name, inp))
@@ -562,18 +584,19 @@ class Agent:
                 span_id=span_id,
                 parent_span_id=parent,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                payload={"name": name, "input": inp, "error": str(exc)},
+                payload={"name": name, "input": event_input, "error": str(exc)},
             )
             raise
         else:
             failed = self._looks_like_tool_failure(name, raw_result, result)
+            event_result = "[REDACTED: shell output returned only to model]" if name == "run_shell" else result
             self._emit_event(
                 "tool.failed" if failed else "tool.completed",
                 status="failed" if failed else "completed",
                 span_id=span_id,
                 parent_span_id=parent,
                 duration_ms=int((time.perf_counter() - started) * 1000),
-                payload={"name": name, "input": inp, "result": result},
+                payload={"name": name, "input": event_input, "result": event_result},
             )
             return result
         finally:
@@ -581,6 +604,13 @@ class Agent:
                 self._active_tool_span_id = None
 
     def _emit_tool_denied(self, call_id: str, name: str, inp: dict, reason: str) -> None:
+        if "Sandbox path violation" in reason:
+            self._emit_event(
+                "sandbox.violation",
+                status="denied",
+                parent_span_id=getattr(self, "_turn_span_id", None),
+                payload={"tool": name, "reason": reason},
+            )
         self._emit_event(
             "tool.denied",
             status="denied",
@@ -591,7 +621,11 @@ class Agent:
                 or getattr(self, "_turn_span_id", None)
                 or getattr(self, "_parent_span_id", None)
             ),
-            payload={"name": name, "input": inp, "reason": reason},
+            payload={
+                "name": name,
+                "input": {"command": "[REDACTED]"} if name == "run_shell" else inp,
+                "reason": reason,
+            },
         )
 
     def set_confirm_fn(self, fn:Callable[[str], Awaitable[bool]]) -> None:
@@ -669,10 +703,30 @@ class Agent:
             payload={"userMessage": _safe_utf8_text(user_message)},
         )
         # 阶段 1：首次对话发现 MCP 工具；子 Agent 不再重复创建 MCP 子进程。
-        if not self._mcp_initialized and not self.is_sub_agent:
+        if (
+            not self._mcp_initialized
+            and not self.is_sub_agent
+            and self.permission_mode != "plan"
+        ):
             self._mcp_initialized = True
             try:
-                await self._mcp_manager.load_and_connect()
+                project_servers = self._mcp_manager.project_server_names()
+                include_project = False
+                if project_servers:
+                    trust_message = (
+                        "Trust project MCP configuration and start these servers inside the sandbox: "
+                        + ", ".join(project_servers)
+                    )
+                    if self.permission_mode != "dontAsk":
+                        include_project = await self._confirm_dangerous(trust_message)
+                    if not include_project:
+                        self._emit_event(
+                            "mcp.trust.denied",
+                            status="denied",
+                            parent_span_id=self._turn_span_id,
+                            payload={"serverNames": project_servers},
+                        )
+                await self._mcp_manager.load_and_connect(include_project=include_project)
                 mcp_defs = self._mcp_manager.get_tool_definitions()
                 if mcp_defs:
                     self.tools = self.tools + mcp_defs
@@ -1009,6 +1063,12 @@ class Agent:
         tasks = [task for task in self._background_skill_tasks if not task.done()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def close(self) -> None:
+        """先停止 MCP，再由主 Agent 删除其拥有的 Sandbox。"""
+        await self._mcp_manager.disconnect_all()
+        if self._owns_sandbox:
+            await self._sandbox_session.close()
 
     def _pop_pending_skill_extraction_window(self, next_user_feedback: str) -> dict[str, Any] | None:
         """用下一轮反馈补全上一轮对话窗口，再交给在线 Skill 抽取器。"""
@@ -1566,7 +1626,18 @@ class Agent:
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
         # 其余名称落到 tools.py：这里包含读写文件、搜索、Shell 等内置能力。
-        result = await execute_tool(name, inp, self._read_file_state)
+        result = await execute_tool(
+            name,
+            inp,
+            self._read_file_state,
+            sandbox_session=self._sandbox_session,
+            violation_sink=lambda reason: self._emit_event(
+                "sandbox.violation",
+                status="denied",
+                parent_span_id=getattr(self, "_active_tool_span_id", None),
+                payload={"tool": name, "reason": reason},
+            ),
+        )
         if name in {"skill_create", "skill_evolve"}:
             try:
                 parsed = json.loads(result)
@@ -1631,11 +1702,13 @@ class Agent:
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
-                permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+                permission_mode=self.permission_mode,
+                confirm_fn=getattr(self, "confirm_fn", None),
                 event_sink=getattr(self, "_event_sink", None),
                 agent_id=f"{getattr(self, 'agent_id', 'main')}/skill-{inp.get('skill_name', 'fork')}",
                 parent_span_id=sub_span,
                 session_id=getattr(self, "session_id", None),
+                sandbox_session=getattr(self, "_sandbox_session", None),
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
@@ -1769,6 +1842,8 @@ class Agent:
         print_sub_agent_start(agent_type, description)
 
         config = get_sub_agent_config(agent_type)
+        parent_tool_names = {tool["name"] for tool in self.tools}
+        child_tools = [tool for tool in config["tools"] if tool["name"] in parent_tool_names]
 
         sub_agent = Agent(
             model=self.model,
@@ -1776,13 +1851,15 @@ class Agent:
             anthropic_base_url=getattr(self, "_anthropic_base_url", None),
             api_key=getattr(self, "_api_key", None),
             custom_system_prompt=config["system_prompt"],
-            custom_tools=config["tools"],
+            custom_tools=child_tools,
             is_sub_agent=True,
-            permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+            permission_mode=self.permission_mode,
+            confirm_fn=getattr(self, "confirm_fn", None),
             event_sink=getattr(self, "_event_sink", None),
             agent_id=f"{getattr(self, 'agent_id', 'main')}/{agent_type}",
             parent_span_id=sub_span,
             session_id=getattr(self, "session_id", None),
+            sandbox_session=getattr(self, "_sandbox_session", None),
         )
         try:
             result = await sub_agent.run_once(prompt)

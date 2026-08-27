@@ -1,0 +1,12 @@
+{
+  "sandbox": {
+    "backend": "docker",
+    "image": "bear-code-sandbox:latest",
+    "network": "none",
+    "memory": "1g",
+    "cpus": 1,
+    "pidsLimit": 128,
+    "commandTimeoutSeconds": 120,
+    "maxOutputBytes": 1048576
+  }
+}

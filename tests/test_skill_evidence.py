@@ -132,6 +132,10 @@ class AgentSkillExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fork_execution_records_invocation_before_child_result(self):
         agent = self._agent()
+        agent.permission_mode = "acceptEdits"
+        agent.confirm_fn = object()
+        agent._sandbox_session = object()
+        captured = {}
         resolved = {
             "name": "fork-skill",
             "prompt": "fork instructions",
@@ -143,7 +147,7 @@ class AgentSkillExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeSubAgent:
             def __init__(self, **kwargs):
-                pass
+                captured.update(kwargs)
 
             async def run_once(self, prompt):
                 return {"text": "fork complete", "tokens": {"input": 2, "output": 3}}
@@ -160,6 +164,9 @@ class AgentSkillExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent._turn_invoked_skills["fork-skill"]["count"], 1)
         self.assertEqual(agent.total_input_tokens, 2)
         self.assertEqual(agent.total_output_tokens, 3)
+        self.assertEqual(captured["permission_mode"], "acceptEdits")
+        self.assertIs(captured["confirm_fn"], agent.confirm_fn)
+        self.assertIs(captured["sandbox_session"], agent._sandbox_session)
 
     async def test_permission_denial_never_reaches_skill_execution(self):
         agent = self._agent()

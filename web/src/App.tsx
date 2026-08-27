@@ -50,6 +50,14 @@ function sessionTitle(session: SessionSummary): string {
   return `Session ${session.id.slice(0, 5)}`;
 }
 
+const SANDBOX_STATUS_LABELS: Record<string, string> = {
+  "not-started": "未启动",
+  running: "运行中",
+  stopped: "已停止",
+  closed: "已关闭",
+  "unsafe-local": "本地不隔离",
+};
+
 function TraceItem({ node, depth, onSelect }: { node: TraceNode; depth: number; onSelect: (event: RuntimeEvent) => void }) {
   const [open, setOpen] = useState(depth < 2);
   const hasChildren = node.children.length > 0;
@@ -218,6 +226,26 @@ export default function App() {
       if (incoming.seq <= maxSeqRef.current) return;
       maxSeqRef.current = Math.max(maxSeqRef.current, incoming.seq);
       setEvents((current) => mergeEvent(current, incoming));
+      if (incoming.agentId === "main" && incoming.type === "sandbox.created") {
+        setDetail((current) => current?.sandbox ? {
+          ...current,
+          sandbox: {
+            ...current.sandbox,
+            status: incoming.payload.backend === "unsafe-local" ? "unsafe-local" : "running",
+            sandboxId: String(incoming.payload.sandboxId ?? current.sandbox.sandboxId),
+          },
+        } : current);
+      }
+      if (incoming.agentId === "main" && incoming.type === "sandbox.restarted") {
+        setDetail((current) => current?.sandbox && current.sandbox.backend === "docker"
+          ? { ...current, sandbox: { ...current.sandbox, status: "running" } }
+          : current);
+      }
+      if (incoming.agentId === "main" && incoming.type === "sandbox.destroyed") {
+        setDetail((current) => current?.sandbox
+          ? { ...current, sandbox: { ...current.sandbox, status: "closed", sandboxId: null } }
+          : current);
+      }
       if (incoming.agentId === "main" && incoming.type === "turn.started") {
         const content = String(incoming.payload.userMessage ?? "");
         setMessages((current) => current.some((item) => item.turnId === incoming.turnId && item.role === "user")
@@ -420,6 +448,12 @@ export default function App() {
         <header className="workspace-head">
           <div className="session-heading"><div className="live-orb"><span></span></div><div><h2>{detail ? sessionTitle(detail) : "准备控制台"}</h2><p>{config ? shortPath(config.cwd) : "Bear Code"} <span>·</span> {detail?.id ?? "—"}</p></div></div>
           <div className="head-actions">
+            {detail?.sandbox && <span
+              className={`sandbox-status sandbox-status-${detail.sandbox.status}`}
+              title={detail.sandbox.workspaceSecretFilesVisible.length
+                ? `工作区敏感文件对执行面可见：${detail.sandbox.workspaceSecretFilesVisible.join(", ")}`
+                : `Backend: ${detail.sandbox.backend} · Network: ${detail.sandbox.network}`}
+            ><i></i>Sandbox {SANDBOX_STATUS_LABELS[detail.sandbox.status] ?? detail.sandbox.status}</span>}
             <label className="permission-select"><span>权限</span><select value={detail?.permissionMode ?? "default"} onChange={(event) => void changePermission(event.target.value)} disabled={!detail || running}>{PERMISSIONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
             {running && <button className="abort-button" onClick={() => void abort()}><span>■</span> 中止</button>}
           </div>

@@ -62,6 +62,8 @@ def test_web_api_hides_credentials_and_changes_idle_permission(tmp_path: Path, m
     assert config.status_code == 200
     assert "must-not-leak" not in config.text
     assert created.status_code == 201
+    assert created.json()["sandbox"]["status"] == "not-started"
+    assert created.json()["sandbox"]["sandboxId"] is None
     assert resumed.status_code == 200
     assert created.json()["lastEventSeq"] == 1
     assert resumed.json()["lastEventSeq"] == 1

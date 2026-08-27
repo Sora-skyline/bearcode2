@@ -105,6 +105,12 @@ button:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2p
 .session-heading p { margin: 3px 0 0; color: var(--muted); font-size: 8.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .session-heading p span { margin: 0 4px; }
 .head-actions { display: flex; align-items: center; gap: 7px; }
+.sandbox-status { height: 31px; display: flex; align-items: center; gap: 6px; padding: 0 9px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--muted); font-size: 8px; font-weight: 750; white-space: nowrap; }
+.sandbox-status i { width: 6px; height: 6px; border-radius: 50%; background: #b7afa5; }
+.sandbox-status-running { color: #337b65; border-color: #b9d9ce; background: #f1faf7; }
+.sandbox-status-running i { background: #43a47c; box-shadow: 0 0 0 3px rgba(67,164,124,.12); }
+.sandbox-status-unsafe-local { color: var(--danger); border-color: #e4b4ae; background: #fff7f5; }
+.sandbox-status-unsafe-local i { background: var(--danger); }
 .permission-select { height: 31px; display: flex; align-items: center; gap: 6px; padding: 0 4px 0 9px; border: 1px solid var(--line); background: #fff; border-radius: 8px; }
 .permission-select > span { color: var(--muted); font-size: 8px; text-transform: uppercase; letter-spacing: .6px; }
 .permission-select select { border: 0; background: transparent; color: var(--ink); font-size: 9px; font-weight: 700; outline: 0; }

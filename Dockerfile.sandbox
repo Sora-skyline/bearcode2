@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        grep \
+        nodejs \
+        npm \
+        procps \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/bear-code-requirements.txt
+RUN python -m pip install --no-cache-dir \
+        -r /tmp/bear-code-requirements.txt \
+        pytest \
+    && rm /tmp/bear-code-requirements.txt
+
+RUN groupadd --gid 1000 bear \
+    && useradd --uid 1000 --gid 1000 --create-home bear
+
+WORKDIR /workspace
+USER bear
+
+CMD ["sh", "-c", "trap : TERM INT; sleep infinity & wait"]

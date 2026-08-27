@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan", action="store_true", help="Plan mode: read-only")
     parser.add_argument("--accept-edits", action="store_true", help="Auto-approve file edits")
     parser.add_argument("--dont-ask", action="store_true", help="Auto-deny confirmations (for CI)")
+    parser.add_argument(
+        "--unsafe-local",
+        action="store_true",
+        help="Explicitly run Shell/MCP on the host without Docker isolation",
+    )
     parser.add_argument("--thinking", action="store_true", help="Enable extended thinking")
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
@@ -379,6 +384,17 @@ async def run_one_shot(agent: Agent, prompt: str) -> None:
     await agent.drain_background_skill_tasks()
 
 
+async def run_with_cleanup(agent: Agent, prompt: str | None) -> None:
+    """统一保证 CLI 的 MCP 和 Sandbox 生命周期被完整收尾。"""
+    try:
+        if prompt is None:
+            await run_repl(agent)
+        else:
+            await run_one_shot(agent, prompt)
+    finally:
+        await agent.close()
+
+
 def main() -> None:
     """CLI 程序入口：准备运行配置，创建 Agent，并按参数选择一次性执行或交互模式。"""
     # 解析命令行参数，例如 --plan、--resume、--model，以及可选的一次性 prompt。
@@ -395,6 +411,7 @@ Options:
   --plan              Plan mode: read-only, describe changes without executing
   --accept-edits      Auto-approve file edits, still confirm dangerous shell
   --dont-ask          Auto-deny anything needing confirmation (for CI)
+  --unsafe-local      Explicitly disable Docker isolation and execute on host
   --thinking          Enable extended thinking (Anthropic only)
   --model, -m         Model to use (default: deepseek-chat, or MODEL env)
   --api-base URL      Override API base URL from CLI or .env
@@ -459,6 +476,7 @@ Examples:
             thinking=args.thinking,
             max_cost_usd=args.max_cost,
             max_turns=args.max_turns,
+            unsafe_local=args.unsafe_local,
         )
         print_info(f"Bear Code Developer Console: http://127.0.0.1:{args.port}")
         uvicorn.run(create_web_app(manager), host="127.0.0.1", port=args.port, log_level="info")
@@ -484,6 +502,7 @@ Examples:
         api_base=resolved_api_base if resolved_use_openai else None,
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
+        unsafe_local=args.unsafe_local,
     )
 
     # Resume session
@@ -505,18 +524,11 @@ Examples:
     # 如果命令行后面带了普通文本参数，就拼成一次性 prompt；否则进入交互式 REPL。
     prompt = " ".join(args.prompt) if args.prompt else None
 
-    if prompt:
-        # One-shot mode
-        # 一次性模式：执行完用户 prompt 后进程结束。
-        try:
-            asyncio.run(run_one_shot(agent, prompt))
-        except Exception as e:
-            print_error(str(e))
-            sys.exit(1)
-    else:
-        # Interactive REPL
-        # 交互模式：启动循环读取用户输入，直到用户退出。
-        asyncio.run(run_repl(agent))
+    try:
+        asyncio.run(run_with_cleanup(agent, prompt))
+    except Exception as e:
+        print_error(str(e))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
