@@ -270,15 +270,18 @@ Maintainer 会看到候选内容、相似 Skills、原有说明和触发条件�
 
 安全判断由 Harness 完成，不交给模型自己决定。
 
-当前权限链路包含三层：
+当前安全链路包含四层：
 
 1. **权限规则**：用户级和项目级配置可以显式允许或拒绝某类工具及命令。
 2. **权限模式**：默认模式需要确认高风险操作；`dontAsk` 自动拒绝；`acceptEdits` 自动允许文件编辑；`bypassPermissions` 跳过确认。
 3. **危险模式识别**：对删除、Git 强制操作、提权、格式化磁盘、杀进程、关机重启等明显高风险 Shell 命令进行拦截或确认。
+4. **Docker Sandbox**：获准 Shell 仍只在会话级容器中执行；容器默认断网、非 root、只读 rootfs、无 Linux capability，并限制 CPU、内存、PID、超时和输出。
 
-文件工具还有独立的一致性保护：覆盖已有文件前必须先读取，并记录读取时的 `mtime`；如果文件之后被外部修改，写入会被拒绝并要求重新读取。
+Approval 与 Sandbox 是分开的：前三层决定是否询问，第四层决定进程技术上能访问什么。因此 `bypassPermissions` 只跳过确认，不能跳出容器；只有启动参数 `--unsafe-local` 能显式选择宿主执行。危险命令正则只是风险提示，不承担主要安全边界。
 
-当前 Shell 判断属于显式规则和危险模式检测，不是操作系统级沙箱。生产环境还应增加工作区路径隔离、容器沙箱、命令 AST 分析和统一审计。
+文件工具还有独立的路径与一致性保护：canonical path 只能在 workspace 或明确 Runtime 目录中，拒绝绝对越界、`..` 和符号链接逃逸；覆盖已有文件前必须先读取并记录 `mtime`，外部修改后必须重新读取。
+
+V1 的承诺是保护 workspace 外宿主资源，不是保护 workspace 本身，也不是多租户强隔离。生产多租户场景还应采用远程 Sandbox 或 microVM、copy-on-write workspace、凭据 broker 和细粒度网络代理。
 
 ### 22. 主 Agent 和子 Agent 共享信息吗？信息不足怎么办？
 
@@ -294,11 +297,11 @@ Maintainer 会看到候选内容、相似 Skills、原有说明和触发条件�
 
 Agent Loop 必须等工具返回 observation 才能继续推理，因此工具阻塞会卡住当前执行链。
 
-当前项目已经覆盖两个关键位置：Shell 默认 30 秒超时，超时结果会回写模型；MCP Server 初始化和工具发现默认 15 秒超时，单个 Server 失败时会被隔离，不影响其他 Server 和主 Agent 启动。
+当前项目已经覆盖两个关键位置：Shell 默认 30 秒、配置上限 120 秒，超时或取消会重启整个 Session 容器清理进程树，再把结果回写模型；MCP Server 初始化和工具发现默认 15 秒超时，单个 Server 失败时不会影响其他 Server 和主 Agent 启动。
 
 上下文层还会记录失败和重复调用信号，必要时通过结构化折叠清理失败路径。
 
-当前普通 MCP `tools/call` 还没有统一的单次调用超时。后续应给所有工具增加 per-call timeout、取消传播、熔断和子进程清理，形成统一的 Tool Executor。
+当前普通 MCP `tools/call` 还没有统一的单次调用超时；容器因 Shell 超时重启后 MCP 也不会自动重连。这是 V1 明确保留的两个生命周期限制。
 
 ### 24. 上下文会话折叠解决了什么问题？
 
@@ -530,8 +533,8 @@ BearCode 已有 GAIA/HLE 和折叠消融，但若要与 Coding Harness 正面比
 
 **P0：先补 Runtime 可靠性与安全。**
 
+- 已完成轻量 Docker Sandbox、默认断网、资源限制、文件路径收口、超时进程树清理和子 Agent 权限继承修复。
 - 统一所有工具的超时、取消、熔断和错误类型。
-- 增加工作区隔离、进程树清理和操作系统级沙箱。
 - 工具参数使用 JSON Schema 严格校验，非法参数不进入执行层。
 - 为权限、上下文折叠和文件修改增加 checkpoint 与可恢复测试。
 
@@ -711,7 +714,7 @@ BearCode 当前的子 Agent 采用隔离上下文和结果返回模式，但没�
   ∩ 当前任务临时能力
 ```
 
-BearCode 已经让 `explore` 和 `plan` 子 Agent 只获得只读工具，并禁止子 Agent 再递归创建 Agent。但当前 `general` 子 Agent 和 fork Skill 在父 Agent 非 Plan Mode 时会使用 `bypassPermissions`，这可能使子 Agent 的有效权限高于父 Agent，是现有实现中需要优先修复的问题。
+BearCode 的 `explore` 和 `plan` 子 Agent 只获得只读工具，并禁止子 Agent 再递归创建 Agent；`general` 和 fork Skill 现在也继承父 Agent 的权限模式与确认回调，工具取父集合和自身白名单的交集，不再自动升级为 `bypassPermissions`。所有子 Agent 共享父级 Sandbox Session，因此不能通过重新创建执行环境扩大挂载或网络边界。
 
 后续还要解决共享写状态：不同子 Agent 同时修改相同文件时，应使用独立工作区、单写者或版本检查；父 Agent 中止后，也必须取消所有子 Agent、工具调用和子进程。
 
@@ -740,7 +743,7 @@ BearCode 已经分别实现了这些能力中的大部分，包括动态 System 
 
 ### 55. 如何防止工具结果或 MCP Server 对 Agent 发起 Prompt Injection？
 
-当前 System Prompt 会提醒模型把工具结果视为可能不可信内容，权限层也能阻止部分危险操作。但这主要依赖模型识别，不能作为完整安全边界。
+当前 System Prompt 会提醒模型把工具结果视为可能不可信内容，权限层能阻止部分危险操作，Docker Sandbox 还能确定性限制被诱导命令的宿主访问范围。但 Sandbox 只控制爆炸半径，不能判断一段工具内容是否在语义上欺骗了模型，因此 Prompt Injection 防御仍不能只依赖执行隔离。
 
 更可靠的方案分四层：
 
@@ -818,6 +821,170 @@ BearCode 当前用 GAIA/HLE 的 `Pass@1` 评估整体任务能力，用上下文
 
 BearCode 不只是单次 API 调用：它实现了两种模型协议的多轮工具循环、权限检查、文件一致性保护、MCP、子 Agent、Session 恢复、结构化上下文折叠，以及带 provenance、版本和在线评测的 Skill 演化。项目还有 GAIA/HLE 基线与折叠消融，说明部分设计经过了效果验证。
 
-但它目前仍是本地工程原型，不具备完整的操作系统级沙箱、高并发服务、统一 Tool Executor、端到端 Trace、完整自动化测试和生产级多租户隔离。这些不应该包装成已经完成。
+但它目前仍是本地工程原型。它已经有轻量 Docker Sandbox、路径边界和结构化事件，却不具备远程 Sandbox 调度、microVM、copy-on-write workspace、高并发服务、统一 Tool Executor 和生产级多租户隔离。这些不应该包装成已经完成。
 
-最好的回应不是争论“是不是 Toy”，而是展示清楚的工程路线：先补 Schema、超时、取消、幂等和子 Agent 权限；再统一 Provider、Context 和 Event；然后做 Trace/Replay、Coding Task、安全评测和并发压测。这样能说明自己知道原型和生产系统之间差在哪里，也知道如何用测试与指标逐步跨过去。
+最好的回应不是争论“是不是 Toy”，而是展示一项已经完成的纵向改进：从应用层危险命令正则，升级为 Approval/Sandbox 分层、会话级容器、资源限制、超时进程树清理和攻击用例；同时明确下一步仍需 checkpoint、MCP 重连和远程隔离。这样能说明自己知道原型和生产系统之间差在哪里，也能用代码和评测逐步缩小差距。
+
+## 九、Sandbox 专项问答
+
+### 61. 完全没用过 Docker，怎么用一句话解释 Image 和 Container？
+
+Image 是装好运行环境的只读模板，Container 是这个模板启动后的一次运行实例。
+
+可以类比成“类”和“对象”：`Dockerfile.sandbox` 描述如何制作模板，`docker build` 得到
+`bear-code-sandbox:latest` Image；每个 BearCode 主 Session 再从它创建一个 Container。
+删除 Container 不会删除 Image，下次 Session 仍可从同一 Image 创建新实例。
+
+Container 不是完整虚拟机。它共享宿主机内核，所以启动较快、成本较低；代价是隔离强度
+通常不如 microVM。对单用户本地 Demo，这是安全性、复杂度和可演示性的合适平衡。
+
+### 62. BearCode 的一条 Shell 命令到底在哪里执行？
+
+Agent Loop、模型客户端、审批和 Trace 都在宿主机；宿主 API Key 环境变量不会注入容器，
+只有获准的 Shell 命令进入 Docker Container。例外是 workspace 内文件：如果 Key 写在项目
+`.env`，它会随 bind mount 可见，所以应改放宿主环境或 workspace 外。
+
+```text
+模型提出 run_shell("pytest")
+  -> check_permission() 做 Approval
+  -> SandboxSession 懒创建/复用 Container
+  -> docker exec 在 /workspace 执行 pytest
+  -> ExecResult 返回 stdout、stderr、exit code、耗时
+  -> Harness 把结果回写模型
+```
+
+因此模型并不“住在 Docker 里”，Docker 只是执行不可信命令的 execution plane。
+
+### 63. 为什么不为每条命令新建一个 Container？
+
+每条命令新建 Container 更容易做到完全干净，但会反复支付 Image 检查、Container 创建和
+启动成本，也无法自然复用 `/tmp` 临时状态或后台服务。
+
+BearCode 选择“一个主 Session 一个持久 Container”：第一次 Shell/MCP 时懒创建，后续用
+`docker exec` 复用，Session 退出时删除。这接近现代 Coding Harness 的 Action Runtime
+思路，同时实现量仍适合 Demo。
+
+需要注意，每次 `docker exec` 仍是新的 Shell；上一条命令里的 `export` 不会自动成为下一
+条命令的环境变量。持久化结果应写入 workspace，长期依赖应预装进 Image。
+
+### 64. Container 为什么能修改我的项目，却看不到其他宿主文件？
+
+因为 BearCode 只做了一个 bind mount：宿主项目目录映射到容器 `/workspace`，并且是读写
+模式。Container 对未挂载的宿主路径没有入口，所以看不到宿主 Home、其他项目或 Docker
+Socket。
+
+这说明 V1 的安全承诺是“保护 workspace 外的宿主资源”，不是“保护 workspace 不被改”。
+Coding Agent 的工作本来就是修改代码；workspace 内误删仍要靠 Approval、Git 和未来的
+checkpoint 恢复。
+
+### 65. `read-only rootfs` 和“项目只读”是一回事吗？
+
+不是。`--read-only` 只让 Container 的系统层只读，例如不能修改 `/bin`、`/etc`；
+`/workspace` 是额外挂进去的读写目录，`/tmp` 是可写但易失的 tmpfs。
+
+可以把它理解成：工作间墙壁和工具柜不能改，项目工作台可以改，临时垃圾桶可以用但重启
+后会清空。
+
+### 66. Approval 和 Sandbox 为什么必须分开？`--yolo` 安全吗？
+
+Approval 判断“这次操作是否符合用户意图、要不要问”；Sandbox 判断“操作获准以后最多能
+访问什么”。危险命令正则适合提醒用户，却无法识别 `python -c`、编译程序或依赖脚本中的
+真实系统调用，因此不能作为技术安全边界。
+
+`--yolo` 只把 Approval 设为 `bypassPermissions`，Shell 仍在 Docker 内，所以没有关闭
+Sandbox。不过它会减少用户拦截 workspace 内错误修改的机会，不能理解成完全无风险。
+
+### 67. `--unsafe-local` 和 `--yolo` 有什么本质区别？
+
+- `--yolo`：不再逐项询问，但仍使用 Docker Sandbox；
+- `--unsafe-local`：Shell/MCP 直接在宿主机执行，明确关闭 Docker 隔离。
+
+前者改变审批策略，后者改变执行边界。`--unsafe-local` 是 Docker 不适用场景的兼容开关，
+不是自动 fallback；Docker 不可用时 BearCode 默认 fail closed，避免用户误以为自己仍在
+沙箱中。
+
+### 68. CPU、内存、PID、超时和输出限制分别解决什么问题？
+
+- CPU 上限减轻死循环长期占满机器；
+- 内存上限限制内存泄漏或恶意分配；
+- PID 上限限制 fork bomb；
+- 命令超时限制卡死任务；
+- 输出上限防止无限日志撑爆 Harness 内存和模型上下文。
+
+这些限制解决的是不同资源维度，不能互相替代。BearCode 默认 1 CPU、1 GiB 内存、128 PID、
+配置最大 120 秒和 1 MiB 输出，适合 Demo，不代表所有项目的生产参数。
+
+### 69. 为什么超时后要重启整个 Container，而不是只 kill 当前进程？
+
+Shell 可能创建子进程、孙进程或后台服务。只杀最外层 `docker exec` 客户端，容器内部进程
+不一定全部退出。重启 Container 能清空整个执行面的进程树，而 workspace 修改因为位于
+宿主 bind mount 上仍然保留。
+
+代价是同一 Container 内的 MCP Server 也会退出。BearCode V1 尚未实现重启后的 MCP 自动
+重连，这是一个明确限制，也是后续合理的升级点。
+
+### 70. MCP 为什么既要“项目信任”，又要放进 Sandbox？
+
+`.mcp.json` 不只是数据，它包含即将启动的 command 和 args。不可信仓库如果能在打开时
+自动启动 MCP，就等于获得了一次隐式代码执行。因此 BearCode 在首次加载项目 MCP 前先让
+用户确认 Server 名称。
+
+信任只说明“用户允许启动”，不说明 Server 永远无漏洞，所以获信任的 stdio Server 仍在
+Sandbox 内运行，只获得配置显式声明的环境变量，不自动继承宿主 API Key 环境变量。
+但 workspace 内的 `.env` 仍然可见；V1 应通过密钥存放约定规避，后续再做 secret masking。
+Plan Mode 不启动 MCP；默认断网时，依赖 `npx -y` 在线下载的 Server 需要预装到 Image。
+
+### 71. 这个 Sandbox 已经达到生产级安全吗？
+
+没有。准确说法是：它为单用户本地 Demo 建立了真实的容器执行边界，并显著缩小 workspace
+外的宿主爆炸半径，但不提供多租户安全保证。
+
+当前缺少 copy-on-write/checkpoint、细粒度 egress proxy、凭据 broker、MCP 自动重连、
+远程 Sandbox Provider、快照和 microVM。Docker daemon 与宿主内核仍是信任根，workspace
+也仍然可写。面试时主动讲清这些边界，比声称“Docker 就绝对安全”更可信。
+
+### 72. 如何证明 Sandbox 不是只画了架构图？
+
+验证分为确定性单元测试和真实容器测试：
+
+- 单元测试检查 Docker hardening 参数、fail closed、路径逃逸、Plan Mode、
+  `bypassPermissions`、MCP 信任、环境变量最小化、超时重启和 Trace 脱敏；
+- Docker 集成测试检查非 root、默认断网、无 Home/Docker Socket/继承的 API Key 环境变量、workspace 状态
+  复用和超时进程清理；
+- `scripts/sandbox_demo.py` 生成攻击用例通过率、cold start 和 warm command P95 报告。
+
+当前仓库已有 53 个 Python 测试通过；真实 Docker 指标必须在装有 Docker 的机器上运行，
+不能用 mock 延迟冒充真实评测。
+
+### 73. 为什么旧对话没有 `sandbox.created`，却出现了 `sandbox.destroyed`？
+
+这是旧生命周期实现的可观测性 Bug，不代表曾经创建并删除过 Container。`Agent` 初始化时
+会先构造一个懒启动的 `SandboxSession` 对象；旧版在 Session 收尾时无条件发布
+`sandbox.destroyed`，即使期间从未调用 Shell/MCP、从未执行 `docker create`。
+
+现在 `close()` 只有在本地执行面真正启动过，或 Docker Container 确实创建过时才发布
+`sandbox.destroyed`。像只调用 `list_files` 的对话，Sandbox 状态始终是 `not-started`，
+关闭时不会再产生虚假销毁事件。判断执行边界要看 Web 的 Sandbox 状态和成对的
+`sandbox.created`/`sandbox.destroyed`，不能只看到一个旧版 `destroyed` 就反推容器存在过。
+
+### 74. Web 页面里的 Sandbox 状态分别是什么意思？
+
+- `未启动`：Session 对象存在，但尚未调用 Shell 或可信 stdio MCP，因此没有 Container；
+- `运行中`：Docker Container 已创建并启动，后续 Shell 用 `docker exec` 进入它；
+- `已停止`：已创建 Container，但执行面当前未运行，通常只会在异常恢复阶段短暂出现；
+- `已关闭`：实际执行面已经清理；
+- `本地不隔离`：启动时显式用了 `--unsafe-local`，命令直接在宿主执行。
+
+状态旁的提示还会列出 workspace 根目录里对 Container 可见的 `.env`、`.npmrc` 等敏感
+文件名，但不会读取或记录文件内容。这个提示是在诚实展示 bind mount 边界，不等于 Secret
+已经泄露；正确做法仍是不要把模型 Key 放在被挂载的 workspace 中。
+
+### 75. `pytest` 依赖很多项目文件和 Python 包，需要把它们逐个复制进 Container 吗？
+
+不需要逐个复制源码。BearCode 把整个项目 workspace bind mount 到 `/workspace`，所以测试
+文件、被测源码和项目内数据会一起可见；它们仍只有一份，修改也会直接反映到宿主项目。
+
+Python 第三方包属于“运行环境”，不是项目文件。`Dockerfile.sandbox` 会在构建 Image 时
+安装项目 `requirements.txt` 和 pytest。修改依赖后需要重新 `docker build`；由于运行时默认
+断网，不应指望在 Agent 执行过程中临时 `pip install`。若测试依赖数据库或系统服务，则还需
+为 Demo 预装/模拟它们，或明确配置受信任网络，这属于更高一层的运行环境设计。

@@ -25,6 +25,16 @@ export interface SessionSummary {
   protocol: string;
   tokenUsage?: { input: number; output: number };
   lastStatus: string;
+  sandbox?: SandboxSummary;
+}
+
+export interface SandboxSummary {
+  status: "not-started" | "running" | "stopped" | "closed" | "unsafe-local";
+  backend: "docker" | "unsafe-local";
+  sandboxId: string | null;
+  image: string | null;
+  network: string;
+  workspaceSecretFilesVisible: string[];
 }
 
 export interface PendingApproval {

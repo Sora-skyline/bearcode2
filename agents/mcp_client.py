@@ -34,11 +34,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import subprocess
 from pathlib import Path
 from typing import Any
 
+from .sandbox import ExecRequest, SandboxSession
 from .ui import print_error, print_info
 
 
@@ -49,7 +48,8 @@ class McpConnection:
     """管理单个 MCP Server 子进程，以及和它之间的 JSON-RPC 通信。"""
 
     def __init__(self, server_name: str, command: str, args: list[str] | None = None,
-                 env: dict[str, str] | None = None):
+                 env: dict[str, str] | None = None,
+                 sandbox_session: SandboxSession | None = None):
         """保存启动配置，并初始化请求 id、等待队列和后台读取任务状态。"""
         # MCP Server 在配置中的名称，用于后续生成工具名前缀和路由工具调用。
         self.server_name = server_name
@@ -57,8 +57,9 @@ class McpConnection:
         self.command = command
         # 启动命令附带的参数。
         self.args = args or []
-        # 额外环境变量。连接时会和当前进程环境变量合并。
+        # 只有配置显式声明的变量会进入容器，不复制 Harness 的 os.environ。
         self.env = env or {}
+        self.sandbox_session = sandbox_session
         # MCP Server 子进程对象。连接成功前为空。
         self._process: asyncio.subprocess.Process | None = None
         # JSON-RPC 请求 id 自增计数器，用于把请求和响应对应起来。
@@ -70,18 +71,18 @@ class McpConnection:
 
     async def connect(self) -> None:
         """启动 MCP Server 子进程，并开始后台读取它的 stdout。"""
-        # 子进程环境变量 = 当前进程环境变量 + 配置里声明的额外变量。
-        merged_env = {**os.environ, **self.env}
+        if self.sandbox_session is None:
+            raise RuntimeError("MCP is fail-closed because no SandboxSession is configured")
         # 使用 stdio 模式启动 MCP Server：
         # - stdin：客户端向 Server 写 JSON-RPC 请求。
         # - stdout：Server 向客户端返回 JSON-RPC 响应。
         # - stderr：保留错误输出管道，避免 Server 继承当前终端输出。
-        self._process = await asyncio.create_subprocess_exec(
-            self.command, *self.args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=merged_env,
+        self._process = await self.sandbox_session.spawn_stdio(
+            ExecRequest(
+                command=self.command,
+                args=tuple(self.args),
+                env={str(key): str(value) for key, value in self.env.items()},
+            )
         )
         # 后台持续读取 stdout。这里不阻塞 connect()，否则后续无法继续初始化。
         self._reader_task = asyncio.create_task(self._read_loop())
@@ -219,8 +220,9 @@ class McpManager:
     3. 当模型调用 mcp__server__tool 形式的工具时，用 call_tool() 路由到对应 Server。
     """
 
-    def __init__(self):
+    def __init__(self, sandbox_session: SandboxSession | None = None):
         """创建尚未连接的管理器；实际子进程在首次聊天时统一懒加载。"""
+        self.sandbox_session = sandbox_session
         # 已连接的 MCP Server。key 是 server name，value 是对应连接对象。
         self._connections: dict[str, McpConnection] = {}
         # 所有 MCP Server 发现出来的工具定义，保持接近 MCP 原始格式。
@@ -228,14 +230,14 @@ class McpManager:
         # 防止重复连接。load_and_connect() 只应真正执行一次。
         self._connected = False
 
-    async def load_and_connect(self) -> None:
+    async def load_and_connect(self, *, include_project: bool = False) -> None:
         """读取配置，连接所有配置的 MCP Server，并发现它们提供的工具。"""
         if self._connected:
             return
         self._connected = True
 
         # 合并全局、项目和 .mcp.json 配置。后读取的配置会覆盖同名 Server。
-        configs = self._load_configs()
+        configs = self._load_configs(include_project=include_project)
         if not configs:
             return
 
@@ -249,6 +251,7 @@ class McpManager:
                 cfg["command"],
                 cfg.get("args"),
                 cfg.get("env"),
+                self.sandbox_session,
             )
             try:
                 # 连接子进程 -> MCP 初始化握手 -> 查询工具列表。
@@ -306,23 +309,31 @@ class McpManager:
 
     # ─── 配置加载 ──────────────────────────────────────
 
-    def _load_configs(self) -> dict[str, dict]:
-        """按优先级加载并合并 MCP Server 配置。"""
+    def _load_configs(self, *, include_project: bool = False) -> dict[str, dict]:
+        """加载用户配置；只有显式获信任时才叠加项目配置。"""
         merged: dict[str, dict] = {}
 
         # 1. 全局配置：~/.bear/settings.json
         global_path = Path.home() / ".bear" / "settings.json"
         self._merge_config_file(global_path, merged)
 
-        # 2. 当前项目配置：<cwd>/.bear/settings.json
-        project_path = Path.cwd() / ".bear" / "settings.json"
-        self._merge_config_file(project_path, merged)
+        if include_project:
+            # 2. 当前项目配置：<cwd>/.bear/settings.json
+            project_path = Path.cwd() / ".bear" / "settings.json"
+            self._merge_config_file(project_path, merged)
 
-        # 3. Claude Code 约定配置：<cwd>/.mcp.json
-        mcp_json_path = Path.cwd() / ".mcp.json"
-        self._merge_config_file(mcp_json_path, merged)
+            # 3. Claude Code 约定配置：<cwd>/.mcp.json
+            mcp_json_path = Path.cwd() / ".mcp.json"
+            self._merge_config_file(mcp_json_path, merged)
 
         return merged
+
+    def project_server_names(self) -> list[str]:
+        """只发现项目 MCP 名称，供 Agent 在创建任何进程前请求信任。"""
+        configs: dict[str, dict] = {}
+        self._merge_config_file(Path.cwd() / ".bear" / "settings.json", configs)
+        self._merge_config_file(Path.cwd() / ".mcp.json", configs)
+        return sorted(configs)
 
     def _merge_config_file(self, path: Path, target: dict[str, dict]) -> None:
         """把单个配置文件里的 mcpServers 合并进 target。"""

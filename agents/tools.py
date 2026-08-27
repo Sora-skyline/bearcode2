@@ -17,18 +17,18 @@ handler，再在 ``execute_tool`` 注册；若工具有副作用，还要把它�
 
 from __future__ import annotations
 
-import asyncio
 import fnmatch
 import json
 import os
 import re
-import signal
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from tqdm.utils import IS_WIN
 
 from agents.memory import get_memory_dir
+from agents.sandbox import ExecRequest, SandboxError, SandboxSession
 
 ToolDef = dict  # Anthropic tool schema dict
 #权限模式
@@ -40,23 +40,6 @@ EDIT_TOOLS = {"write_file", "edit_file", "skill_evolve", "skill_create"}
 
 #并发安全的工具可以并行运行（只读，无副作用）
 CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search"}
-
-
-
-
-
-
-
-def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
-    """生成本次模型请求真正可见的工具菜单，并去掉 Runtime 私有元数据。"""
-    tools = all_tools if all_tools is not None else tool_definitions
-    return [
-        {k: v for k, v in t.items() if k != "deferred"}
-        for t in tools
-        if not t.get("deferred") or t["name"] in _activated_tools
-    ]
-
-
 
 # 工具定义只描述名字、用途和 JSON 入参，供模型选择；这里没有执行逻辑。
 # 真实实现位于下方 _read_file 等 handler，并由 execute_tool 按 name 分发。
@@ -249,22 +232,36 @@ tool_definitions: list[ToolDef] = [
 
 #----------------------工具调用----------------------------
 
+class ToolPathViolation(ValueError):
+    """文件工具试图逃逸允许根目录。"""
+
+
+def _allowed_tool_roots() -> tuple[Path, ...]:
+    """返回宿主专用文件工具允许访问的最小目录集合。"""
+    roots = (
+        Path.cwd(),
+        get_memory_dir(),
+        Path.home() / ".bear" / "plans",
+        Path.home() / ".bear-code" / "tool-results",
+    )
+    return tuple(root.resolve(strict=False) for root in roots)
+
+
 def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
-    """解析模型给出的路径，并兼容带多余绝对路径前缀的工作区文件名。"""
-    path = Path(raw_path)
-    if path.exists() or not path.is_absolute():
-        return path
+    """规范化模型路径，并拒绝绝对越界、``..`` 和符号链接逃逸。"""
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ToolPathViolation("empty file path")
+    path = Path(raw_path).expanduser()
+    if ".." in path.parts:
+        raise ToolPathViolation("parent traversal ('..') is not allowed")
 
-    parts = path.parts
-    cwd = Path.cwd()
-    for i in range(1, len(parts)):
-        candidate = cwd.joinpath(*parts[i:])
-        if must_exist and candidate.exists():
-            return candidate
-        if not must_exist and candidate.parent.exists():
-            return candidate
-
-    return path
+    candidate = path if path.is_absolute() else Path.cwd() / path
+    resolved = candidate.resolve(strict=False)
+    if not any(resolved == root or resolved.is_relative_to(root) for root in _allowed_tool_roots()):
+        raise ToolPathViolation(f"path is outside workspace/runtime roots: {raw_path}")
+    if must_exist and not resolved.exists():
+        return resolved
+    return resolved
 
 
 #读取文件并且在读取文件的基础上添加行号
@@ -525,81 +522,6 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
     tools = all_tools if all_tools is not None else tool_definitions
     return [t["name"] for t in tools if t.get("deferred") and t["name"] not in _activated_tools]
 
-#执行shell命令
-def _run_shell(inp: dict) -> str:
-    """执行已通过权限层的 Shell 命令，并统一超时与错误文本。"""
-    try:
-        timeout_ms = inp.get("timeout", 30000)
-        timeout_s = timeout_ms / 1000
-        result = subprocess.run(
-            inp["command"],
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
-        output = result.stdout or ""
-        if result.returncode != 0:
-            stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
-            stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
-            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
-        return output or "(no output)"
-    except subprocess.TimeoutExpired:
-        return f"Command timed out after {inp.get('timeout', 30000)}ms"
-    except Exception as e:
-        return f"Error: {e}"
-
-
-async def _stop_shell_process(process: asyncio.subprocess.Process) -> None:
-    """先终止子进程组，短暂等待后再强制结束。"""
-    if process.returncode is not None:
-        return
-    try:
-        if IS_WIN:
-            process.terminate()
-        else:
-            os.killpg(process.pid, signal.SIGTERM)
-        await asyncio.wait_for(process.wait(), timeout=2)
-    except (ProcessLookupError, asyncio.TimeoutError):
-        if process.returncode is None:
-            try:
-                if IS_WIN:
-                    process.kill()
-                else:
-                    os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await process.wait()
-
-
-async def _run_shell_async(inp: dict) -> str:
-    """可取消的 Shell 执行，避免 Web Runtime 在命令运行时阻塞事件流。"""
-    timeout_ms = int(inp.get("timeout", 30000))
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if IS_WIN else 0
-    process = await asyncio.create_subprocess_shell(
-        inp["command"],
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=not IS_WIN,
-        creationflags=creationflags,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_ms / 1000)
-    except asyncio.TimeoutError:
-        await _stop_shell_process(process)
-        return f"Command timed out after {timeout_ms}ms"
-    except asyncio.CancelledError:
-        await _stop_shell_process(process)
-        raise
-    out_text = stdout.decode("utf-8", errors="replace") if stdout else ""
-    err_text = stderr.decode("utf-8", errors="replace") if stderr else ""
-    if process.returncode != 0:
-        out = f"\nStdout: {out_text}" if out_text else ""
-        err = f"\nStderr: {err_text}" if err_text else ""
-        return f"Command failed (exit code {process.returncode}){out}{err}"
-    return out_text or "(no output)"
-
-
 #危险命令检测模式列表
 
 DANGEROUS_PATTERNS = [
@@ -715,13 +637,19 @@ def check_permission(
     """根据规则、权限模式和操作风险返回 allow、deny 或 confirm。
 
     本函数不执行确认交互；它只返回决策，主 Agent 再通过 ``confirm_fn`` 向用户询问。
-    Plan Mode 仅允许只读工具及指定 plan 文件，``bypassPermissions`` 则最先放行。
-
-    权限判断和工具执行分成两个函数，是 Harness 的安全边界：即使模型被错误提示诱导去
-    写文件或执行危险命令，它也不能绕过这段本地代码直接操作系统。
+    Plan Mode 仅允许只读工具及指定 plan 文件。``bypassPermissions`` 只跳过用户审批，
+    文件路径边界和 Shell Sandbox 仍由执行层强制实施。
     """
+    path_key = "file_path" if "file_path" in inp else "path"
+    if tool_name in {"read_file", "write_file", "edit_file", "list_files", "grep_search"}:
+        raw_path = inp.get(path_key) or "."
+        try:
+            _resolve_tool_path(raw_path, must_exist=tool_name != "write_file")
+        except ToolPathViolation as exc:
+            return {"action": "deny", "message": f"Sandbox path violation: {exc}"}
+
     if mode == "bypassPermissions":
-        # yolo 模式最高优先级：跳过配置规则和内置风险判断。
+        # yolo 只跳过 Approval；技术隔离不能在 tool call 中关闭。
         return {"action": "allow"}
 
     # 显式设置规则优先于默认工具分类和权限模式。
@@ -744,6 +672,8 @@ def check_permission(
             return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
         if tool_name == "run_shell":
             return {"action": "deny", "message": "Shell commands blocked in plan mode"}
+        if tool_name.startswith("mcp__"):
+            return {"action": "deny", "message": "MCP tools blocked in plan mode"}
 
     if tool_name in ("enter_plan_mode", "exit_plan_mode"):
         return {"action": "allow"}
@@ -788,7 +718,11 @@ def check_permission(
 # 'agent' 和 'skill' 这两个工具在 agent.py 中处理，以避免循环依赖。"
 
 async def execute_tool(
-    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+    name: str,
+    inp: dict,
+    read_file_state: dict[str, float] | None = None,
+    sandbox_session: SandboxSession | None = None,
+    violation_sink: Callable[[str], None] | None = None,
 ) -> str:
     """执行一个内置工具，并实施编辑前读取和文件 mtime 一致性保护。
 
@@ -798,6 +732,15 @@ async def execute_tool(
     调用方已经做过权限检查；本函数关注执行和一致性保护。返回值统一为文本，之后由
     Agent 包装成对应模型协议的工具结果消息。
     """
+    if name in {"read_file", "write_file", "edit_file", "list_files", "grep_search"}:
+        path_key = "file_path" if "file_path" in inp else "path"
+        try:
+            _resolve_tool_path(inp.get(path_key) or ".", must_exist=name != "write_file")
+        except ToolPathViolation as exc:
+            if violation_sink:
+                violation_sink(str(exc))
+            return f"Error: Sandbox path violation: {exc}"
+
     if name == "read_file":
         result = _read_file(inp)
         if read_file_state is not None and not result.startswith("Error"):
@@ -810,7 +753,28 @@ async def execute_tool(
         return _truncate_result(result)
 
     if name == "run_shell":
-        return _truncate_result(await _run_shell_async(inp))
+        if sandbox_session is None:
+            return "Error: Shell execution is fail-closed because no SandboxSession is configured."
+        timeout_ms = int(inp.get("timeout", 30000))
+        try:
+            execution = await sandbox_session.exec(
+                ExecRequest(
+                    command=inp["command"],
+                    timeout_seconds=max(0.001, timeout_ms / 1000),
+                )
+            )
+        except SandboxError as exc:
+            return f"Error: Sandbox unavailable: {exc}"
+        suffix = "\n[output truncated by sandbox]" if execution.output_truncated else ""
+        if execution.timed_out:
+            return f"Command timed out after {timeout_ms}ms; sandbox restarted.{suffix}"
+        if execution.exit_code != 0:
+            stdout = f"\nStdout: {execution.stdout}" if execution.stdout else ""
+            stderr = f"\nStderr: {execution.stderr}" if execution.stderr else ""
+            return _truncate_result(
+                f"Command failed (exit code {execution.exit_code}){stdout}{stderr}{suffix}"
+            )
+        return _truncate_result((execution.stdout or "(no output)") + suffix)
 
     if name in ("write_file", "edit_file") and read_file_state is not None:
         abs_path = str(_resolve_tool_path(inp["file_path"], must_exist=(name == "edit_file")).resolve())
@@ -876,7 +840,6 @@ async def execute_tool(
         "edit_file": _edit_file,
         "list_files": _list_files,
         "grep_search": _grep_search,
-        "run_shell": _run_shell,
     }
     handler = handlers.get(name)
 

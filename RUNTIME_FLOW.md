@@ -2,7 +2,7 @@
 
 本文是 Bear Code 当前行为的唯一流程真相源，描述命令入口、模型循环、工具执行、会话保存，以及在线 Skills 从反馈归因到显式发布的完整链路。
 
-最后校验日期：2026-08-26。
+最后校验日期：2026-08-27。
 
 ## 0. 流程文档维护协议
 
@@ -28,6 +28,9 @@
 
 | 日期 | 状态 | 修改 | 受影响流程 | 验证 |
 | --- | --- | --- | --- | --- |
+| 2026-08-27 | verified | 修正 Sandbox 生命周期事件，增加 Web 状态可观测性并补齐 Demo 测试依赖 | 第 3、7、8 节 | `pytest`: 53 passed、1 Docker integration skipped；Web build、相关 Python Ruff E9/F、全量 Python 编译与 `git diff --check` 通过 |
+| 2026-08-27 | verified | 增加面向 Docker 初学者的 Sandbox 教程与专项面试 QA（flow unchanged） | 第 3、4、7 节的派生说明 | QA 61-72 编号、Markdown 代码围栏、文档链接目标与 `git diff --check` 通过 |
+| 2026-08-27 | verified | 增加轻量 Docker Sandbox，分离执行隔离与用户审批，收紧文件路径和 MCP 启动边界 | 第 1、2、3、4、7、8、10 节 | `pytest`: 49 passed、1 Docker integration skipped（本机无 Docker CLI）；Ruff E9/F、Python 编译与 `git diff --check` 通过 |
 | 2026-08-26 | verified | 用 Mermaid 重绘项目总流程与在线 Skill 治理图（flow unchanged） | 第 1.2、8.1、8.2 节 | 4 个 Mermaid 代码块、章节结构与 `git diff --check` 通过 |
 | 2026-08-26 | verified | 重构为“项目核心总流程 → 分流程”阅读结构（flow unchanged） | 全文结构 | 章节编号、交叉引用与 `git diff --check` 通过 |
 | 2026-08-26 | verified | 在线 Skill 改为 candidate-first，并建立 doc-first 维护协议 | 输入、Agent、在线 Skills、源码索引 | `pytest`: 36 passed；Ruff E9/F 与 `git diff --check` 通过 |
@@ -43,7 +46,7 @@ Bear Code 的核心不是“模型接收一句话并回复”，而是一个带�
 | 核心 | 解决的问题 | 主要实现 |
 | --- | --- | --- |
 | Agent Loop | 让模型在“推理 → 行动 → 观察”之间循环，直到完成任务 | `agents/agent.py` |
-| 工具与权限边界 | 模型只能提出 tool call，真正的文件、Shell、Skill、MCP 操作由 Runtime 审批和执行 | `agents/tools.py`、`agents/agent.py` |
+| 工具、审批与 Sandbox | 模型只能提出 tool call；Runtime 负责审批，Docker Sandbox 负责限制 Shell/MCP 的实际可访问范围 | `agents/tools.py`、`agents/sandbox.py`、`agents/agent.py` |
 | 上下文连续性 | 用 Session、上下文折叠和 Memory 保持长任务状态，同时控制上下文体积 | `agents/session.py`、`agents/memory.py` |
 | 可扩展能力 | 通过 Skills、MCP 和子 Agent 扩展任务方法、外部工具与隔离执行能力 | `agents/skills.py`、`agents/mcp_client.py`、`agents/subagent.py` |
 | 受控自进化 | 将用户反馈先归因、再形成 proposal，经 replay 和双锚点门禁验证后显式发布 | `agents/online_skill_evolution.py`、`agents/online_skill_eval.py` |
@@ -75,16 +78,19 @@ flowchart TD
     subgraph HARNESS[Agentic Harness 核心循环]
         LOOP[调用 OpenAI / Anthropic 模型]
         OUT{模型输出类型}
-        PERM{Runtime 权限检查<br/>与 Plan Mode 限制}
-        ACTION[执行内置工具 / Skill<br/>MCP / 子 Agent]
+        PERM{Approval 权限检查<br/>与 Plan Mode 限制}
+        ACTION[执行文件工具 / Skill<br/>子 Agent]
+        SANDBOX[Docker Sandbox Session<br/>Shell / MCP]
         RESULT[tool result 回写模型]
         STREAM[流式输出最终文本]
 
         LOOP --> OUT
         OUT -->|tool call| PERM
         PERM -->|允许| ACTION
+        ACTION -->|Shell / MCP| SANDBOX
+        SANDBOX --> RESULT
         PERM -->|拒绝| RESULT
-        ACTION --> RESULT
+        ACTION -->|宿主专用工具| RESULT
         RESULT --> LOOP
         OUT -->|最终文本| STREAM
     end
@@ -108,9 +114,10 @@ flowchart TD
     ACTIVE --> LOOP
 ```
 
-其中有三条不可绕过的边界：
+其中有四条不可绕过的边界：
 
-- 模型不能直接操作环境，所有动作都经过 Runtime 工具与权限层。
+- 模型不能直接操作环境，所有动作都经过 Runtime 工具路由。
+- Approval 只决定是否询问用户；即使是 `bypassPermissions`，Shell/MCP 仍在 Sandbox 内。只有进程启动时显式 `--unsafe-local` 才使用宿主执行。
 - 后台在线演化不能直接修改 active Skill，只能生成隔离 proposal。
 - `/skill-eval` 只记录 champion，只有显式 `/skill-promote` 才改变线上能力。
 
@@ -214,7 +221,7 @@ REPL 和一次性命令的区别只在输入与退出方式。两者最终都调
 
 `main.main()` 依次调用：
 
-1. `parse_args()`：解析 prompt、模型、权限模式、费用和轮次限制等参数。
+1. `parse_args()`：解析 prompt、模型、权限模式、费用、轮次限制和显式 `--unsafe-local` 兼容模式。
 2. `_load_env_file()`：用 `find_dotenv(usecwd=True)` 从当前工作目录查找 `.env`，再用 `load_dotenv()` 加载，但不覆盖进程中已经存在的环境变量。
 3. `_resolve_permission_mode()`：按 `--yolo`、`--plan`、`--accept-edits`、`--dont-ask` 选择 Agent 内部权限模式。
 4. `_resolve_api_config()`：解析 API Base URL、API Key 和后端类型。
@@ -223,6 +230,8 @@ REPL 和一次性命令的区别只在输入与退出方式。两者最终都调
    - path 以 `/anthropic` 结尾或包含 `/anthropic/` 时选择 Anthropic SDK；其他非空 URL 选择 OpenAI SDK。
 5. 模型名按 `--model`、`MODEL`、`deepseek-chat` 的优先级确定。
 
+Sandbox 配置从 `~/.bear/settings.json` 与项目 `.bear/settings.json` 的 `sandbox` 对象合并，项目配置优先。默认使用 Docker、断网、1 CPU、1 GiB 内存、128 PID、120 秒命令上限和 1 MiB 输出上限。Docker 不可用或镜像不存在时 fail closed，不会静默回退宿主执行。
+
 ### 3.2 创建 Agent
 
 `main()` 调用 `Agent.__init__()`。初始化期间的项目函数调用是：
@@ -230,10 +239,12 @@ REPL 和一次性命令的区别只在输入与退出方式。两者最终都调
 ```text
 Agent.__init__()
 ├─ agent._get_context_windows()
+├─ sandbox.load_sandbox_config()
+├─ sandbox.SandboxSession.__init__()                    [主 Agent 拥有；子 Agent 共享]
 ├─ Agent._resolve_thinking_mode()
 │  ├─ Agent._model_supports_thinking()                   [开启 --thinking]
 │  └─ Agent._model_supports_adaptive_thinking()          [模型支持 thinking]
-├─ mcp_client.McpManager.__init__()
+├─ mcp_client.McpManager.__init__()                     [复用 Sandbox Session]
 ├─ prompt.build_system_prompt()
 │  ├─ prompt.get_git_context()
 │  ├─ prompt.load_claude_md()
@@ -315,15 +326,18 @@ Agent.chat(user_message)
 
 ### 4.1 第一次聊天时加载 MCP
 
-`Agent.chat()` 只在主 Agent 的第一次聊天中调用 `McpManager.load_and_connect()`：
+`Agent.chat()` 只在主 Agent 的第一次非 Plan Mode 聊天中读取 MCP 配置；Plan Mode 不启动 MCP 进程，退出后再懒加载。项目级 `.bear/settings.json` 和 `.mcp.json` 必须先通过一次会话级信任确认；拒绝或无交互确认时只加载用户级配置。获信任的 stdio Server 通过当前 Sandbox Session 启动，不继承宿主 `os.environ`：
 
 ```text
 McpManager.load_and_connect()
-├─ McpManager._load_configs()
+├─ McpManager.project_server_names()                    [项目配置存在时先请求信任]
+├─ McpManager._load_configs(include_project=...)
 │  └─ McpManager._merge_config_file()                    [每个候选配置文件]
 └─ 对每个 MCP Server
    ├─ McpConnection.__init__()
    ├─ McpConnection.connect()
+   │  ├─ SandboxSession.start()                          [懒创建容器]
+   │  ├─ SandboxSession.spawn_stdio()
    │  └─ McpConnection._read_loop()                      [后台任务]
    ├─ McpConnection.initialize()
    │  ├─ McpConnection._send_request("initialize")
@@ -333,7 +347,7 @@ McpManager.load_and_connect()
    └─ McpConnection.close()                              [连接失败]
 ```
 
-单个 MCP Server 失败只打印错误，不会阻止主模型继续运行。成功发现的工具由 `get_tool_definitions()` 加上 `mcp__<server>__<tool>` 前缀，再追加到 Agent 工具列表。
+单个 MCP Server 失败只打印错误，不会阻止主模型继续运行。成功发现的工具由 `get_tool_definitions()` 加上 `mcp__<server>__<tool>` 前缀，再追加到 Agent 工具列表。配置中的 `env` 可显式传入 Server，但模型 API Key 和其他宿主环境变量不会被自动复制到容器。
 
 ### 4.2 Skill 自动检索
 
@@ -496,7 +510,7 @@ tools.check_permission()
 │  │  └─ tools._parse_rule()
 │  └─ tools._matches_rule()
 ├─ tools.is_dangerous()                                 [Shell]
-└─ tools._resolve_tool_path()                            [文件写入检查]
+└─ tools._resolve_tool_path()                            [canonicalize + allowed roots]
 
 Agent._confirm_dangerous()                              [需要确认]
 ├─ ui.print_confirmation()
@@ -511,6 +525,10 @@ Agent._execute_tool_call()
 │     └─ McpConnection.call_tool()
 │        └─ McpConnection._send_request("tools/call")
 └─ tools.execute_tool()                                  [内置工具]
+
+Sandbox 与 Approval 是两层独立机制：`check_permission()` 的 allow/deny/confirm 只处理用户意图；`SandboxSession` 决定获准代码在技术上能访问什么。`bypassPermissions` 只跳过前者，不能改变后者。Plan Mode 继续禁止 Shell 和普通写入，`acceptEdits` 只自动批准文件编辑。
+
+主 Agent 持有一个懒启动的持久 Sandbox Session，子 Agent 继承父权限模式、取父工具集合与自身白名单的交集，并共享该 Session。Web 会话摘要直接暴露 `not-started`、`running`、`stopped`、`closed` 或 `unsafe-local` 状态，避免仅靠生命周期事件猜测容器是否存在。主会话结束时关闭 MCP，再删除实际创建过的容器；从未启动过执行面的 Session 不发布 `sandbox.destroyed`。
 
 Agent._persist_large_result()
 ui.print_tool_result()
@@ -530,12 +548,18 @@ ui.print_tool_result()
 | `edit_file` | `_resolve_tool_path()` 做读后写校验 → `_edit_file()` → `_resolve_tool_path()` → `_find_actual_string()` → `_normalize_quotes()`（直接匹配失败时）→ `_generate_diff()` → `_truncate_result()` |
 | `list_files` | `_list_files()` → `_resolve_tool_path()` → `_truncate_result()` |
 | `grep_search` | `_grep_search()` → `_resolve_tool_path()` → `_grep_python()`（系统 grep 不可用时）→ 其内部 `walk()` → `_truncate_result()` |
-| `run_shell` | `_run_shell()` → `_truncate_result()` |
+| `run_shell` | `SandboxSession.exec(ExecRequest)` → `ExecResult` 格式化；超时或取消会重启容器以清理进程树 |
 | `tool_search` | 激活命中的延迟工具 → `_truncate_result()` 不参与该分支 |
 | `skill_create` | `skills.create_skill()` → `_truncate_result()`；成功后 `Agent._refresh_runtime_system_prompt()` |
 | `skill_evolve` | `skills.evolve_skill()` → `_truncate_result()`；成功后 `Agent._refresh_runtime_system_prompt()` |
 
 `read_file_state` 保存最近一次成功读取文件时的修改时间。写入已有文件之前，`execute_tool()` 要求该文件已经读取且未被外部修改。
+
+宿主侧文件工具只允许 canonical path 位于当前 workspace 或 Runtime 明确状态目录（当前项目 Memory、plan 文件目录、超大工具结果目录）。绝对路径越界、任何 `..` 路径段、符号链接逃逸和指向允许根目录外的父目录都会拒绝，并产生 `sandbox.violation` 事件。
+
+Docker Session 只把 workspace 读写挂载到 `/workspace`，不挂载 Home、Docker Socket 或其他宿主目录。容器使用数字非 root UID、只读 rootfs、`tmpfs /tmp`、`cap-drop=ALL`、`no-new-privileges`、默认无网络及资源上限。Demo 镜像预装项目 `requirements.txt` 与 pytest，因此挂载源码后可以直接运行项目测试。生命周期发布 `sandbox.created`、`sandbox.exec.started/completed/failed`、`sandbox.restarted` 和 `sandbox.destroyed` 事件；`sandbox.destroyed` 只对应实际创建过的执行面，事件只记录命令摘要、耗时、退出码与限制，不记录完整命令或 Secret。
+
+不继承宿主环境变量只阻止了 Harness 主动注入 API Key；workspace 是读写挂载，因此项目目录中的 `.env`、`.npmrc` 等文件仍然对容器可见。Sandbox 状态快照只报告这些敏感文件的相对文件名作为风险提示，不读取或记录内容。V1 将其作为明确限制，不宣称提供 Secret 文件隔离。
 
 ### 7.3 Anthropic 工具结果回传
 
@@ -600,7 +624,7 @@ Agent.chat()
    └─ session.save_session()
 ```
 
-一次性模式还会调用 `Agent.drain_background_skill_tasks()`，等待本轮创建的后台 Skill 任务结束，然后进程退出。REPL 则回到 `while True`，重新调用 `ui.print_user_prompt()` 等待下一条输入；退出整个 REPL 前也会调用 `drain_background_skill_tasks()`。
+一次性模式还会调用 `Agent.drain_background_skill_tasks()`，等待本轮创建的后台 Skill 任务结束，然后调用 `Agent.close()` 关闭 MCP 与 Sandbox。REPL 回到 `while True` 等待下一条输入，退出时执行相同清理。Web Runtime 在应用 lifespan shutdown 中关闭所有 Session 的 Agent；未懒启动过 Sandbox 的会话只关闭对象，不产生虚假的 `sandbox.destroyed` 事件。
 
 ### 8.1 在线 Skill proposal 状态机
 
@@ -726,6 +750,7 @@ main.main()
 - `agents/agent.py`：Agent 生命周期、双后端模型循环、工具回环、输出、预算和会话收尾。
 - `agents/ui.py`：欢迎页、提示符、流式文本、工具信息和费用的终端渲染。
 - `agents/tools.py`：内置工具 schema、权限判断和实际执行。
+- `agents/sandbox.py`：Sandbox 配置、Docker/显式本地执行 Session、资源限制与生命周期事件。
 - `agents/prompt.py`：动态系统提示词组装。
 - `agents/mcp_client.py`：MCP 配置、stdio JSON-RPC、工具发现和路由。
 - `agents/skills.py`：Skill 发现、检索、调用和变更。

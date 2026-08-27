@@ -86,6 +86,7 @@ class WebRuntimeManager:
         thinking: bool = False,
         max_cost_usd: float | None = None,
         max_turns: int | None = None,
+        unsafe_local: bool = False,
     ):
         self.model = model
         self.api_base = api_base
@@ -95,6 +96,7 @@ class WebRuntimeManager:
         self.thinking = thinking
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
+        self.unsafe_local = unsafe_local
         self.cwd = str(Path.cwd())
         self._sessions: dict[str, WebSession] = {}
         self._active: tuple[str, str] | None = None
@@ -113,6 +115,7 @@ class WebRuntimeManager:
             api_key=self.api_key,
             event_sink=journal.publish,
             session_id=session_id,
+            unsafe_local=self.unsafe_local,
         )
         state = WebSession(id=session_id, agent=agent, journal=journal)
         self._sessions[session_id] = state
@@ -267,6 +270,7 @@ class WebRuntimeManager:
             "protocol": "openai" if agent.use_openai else "anthropic",
             "tokenUsage": agent.get_token_usage(),
             "lastStatus": state.status,
+            "sandbox": agent._sandbox_session.snapshot(),
         }
 
     @staticmethod
@@ -369,6 +373,10 @@ class WebRuntimeManager:
         tasks = [state.task for state in self._sessions.values() if state.task and not state.task.done()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(
+            *(state.agent.close() for state in self._sessions.values()),
+            return_exceptions=True,
+        )
 
 
 def _sse(event: dict[str, Any]) -> str:
